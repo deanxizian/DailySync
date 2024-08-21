@@ -18,6 +18,14 @@
 如果你不熟悉代码，强烈推荐使用这个版本，在网页上填入账号点击就能同步数据，简洁好用。
 [https://dailysync.vyzt.dev/](https://dailysync.vyzt.dev/)
 
+### 其他仓库备份
+
+gitlab: 
+[https://gitlab.com/gooin/dailysync](https://gitlab.com/gooin/dailysync)
+
+github:（actions方式正常可用）
+[https://github.com/gooin/dailysync-rev](https://github.com/gooin/dailysync-rev)
+
 ## Docker版本
 如果你懂一点代码，会使用 docker 可以使用此方案。
 
@@ -31,8 +39,9 @@ git clone https://gitlab.com/gooin/dailysync.git
 
 ### 修改docker-compsoe.yml 文件
 
-可以通过修改文件中的`command`参数决定每次执行的功能，默认是国际区同步到国区
+可以通过修改文件中的`command`参数决定每次执行的功能，默认是同步中国区到国际区
 
+同步中国区到国际区
 ```shell
 yarn sync_cn
 ```
