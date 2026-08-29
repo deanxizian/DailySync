@@ -1,0 +1,65 @@
+name: Sync Garmin CN to COROS CN
+
+on:
+  workflow_dispatch:
+    inputs:
+      activity_id:
+        description: Optional Garmin CN activity ID
+        type: string
+        default: ''
+  schedule:
+    # Run two hours after the original Garmin workflows.
+    - cron: '0 2,8,14,20 * * *'
+
+permissions:
+  actions: read
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref_name }}
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.19.0
+          run_install: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22.13.0'
+          cache: pnpm
+          cache-dependency-path: coros-sync/pnpm-lock.yaml
+      - name: Acquire Garmin database writer lock
+        id: garmin_db_lock
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: node .github/scripts/garmin-db-lock.cjs acquire
+      - run: pnpm --dir coros-sync install --frozen-lockfile
+      - name: Sync Garmin activities to COROS
+        env:
+          GARMIN_USERNAME: ${{ secrets.GARMIN_USERNAME }}
+          GARMIN_SYNC_NUM: ${{ secrets.GARMIN_SYNC_NUM }}
+          AESKEY: ${{ secrets.AESKEY }}
+          COROS_USERNAME: ${{ secrets.COROS_USERNAME }}
+          COROS_PASSWORD: ${{ secrets.COROS_PASSWORD }}
+          GARMIN_DB_LOCK_COMMIT: ${{ steps.garmin_db_lock.outputs.lock_commit }}
+          SYNC_ACTIVITY_ID: ${{ inputs.activity_id }}
+        shell: bash
+        run: |
+          args=(--time-budget 2700 --apply)
+          if [[ -n "$SYNC_ACTIVITY_ID" ]]; then args+=(--activity-id "$SYNC_ACTIVITY_ID"); fi
+          pnpm --dir coros-sync sync_garmin_cn_to_coros "${args[@]}"
+      - name: Save COROS sync state
+        if: ${{ always() && steps.garmin_db_lock.outputs.acquired == 'true' }}
+        uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: Save COROS Sync State
+          file_pattern: db/garmin.db coros-sync
+      - name: Release Garmin database writer lock
+        if: ${{ always() && steps.garmin_db_lock.outputs.acquired == 'true' }}
+        env:
+          GARMIN_DB_LOCK_COMMIT: ${{ steps.garmin_db_lock.outputs.lock_commit }}
+        run: node .github/scripts/garmin-db-lock.cjs release

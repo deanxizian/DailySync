@@ -45,16 +45,29 @@ jobs:
     runs-on: ubuntu-latest
     name: Sync Garmin CN to Garmin Global
     permissions:
+      actions: read
       contents: write
     steps:
-      - uses: actions/checkout@v3
-      - uses: actions/setup-node@v3
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref_name }}
+      - uses: actions/setup-node@v4
         with:
           node-version: '18'
           cache: 'yarn'
+      - name: Acquire Garmin database writer lock
+        id: garmin_db_lock
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: node .github/scripts/garmin-db-lock.cjs acquire
       - run: yarn
       - run: yarn ${{ github.event.inputs.sync_command || 'sync_cn' }}
         timeout-minutes: 15
       - uses: stefanzweifel/git-auto-commit-action@v5
         with:
           commit_message: Save Garmin Session
+      - name: Release Garmin database writer lock
+        if: ${{ always() && steps.garmin_db_lock.outputs.acquired == 'true' }}
+        env:
+          GARMIN_DB_LOCK_COMMIT: ${{ steps.garmin_db_lock.outputs.lock_commit }}
+        run: node .github/scripts/garmin-db-lock.cjs release
