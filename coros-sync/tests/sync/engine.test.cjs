@@ -356,7 +356,7 @@ test('unknown import outcomes do not automatically retry another Garmin source',
     assert.equal(h.adapters['coros-cn'].uploads.length, 1);
 });
 
-test('transient staging failures retry next run and all definite failures release target snapshots', async t => {
+test('transient staging failures clear durable intents before retrying next run', async t => {
     const targets = [activity('coros-cn', 'old-a', -86400000), activity('coros-cn', 'old-b', -172800000)];
     const h = await harness(t, { 'garmin-cn': [activity('garmin-cn', 'g1')], 'coros-cn': targets });
     h.adapters['coros-cn'].onUpload = async () => {
@@ -368,9 +368,11 @@ test('transient staging failures retry next run and all definite failures releas
     assert.ok(events.some(event => event.status === 'deferred' && event.code === 'TRANSPORT'));
     assert.equal(task.status, 'pending');
     assert.equal(task.beforeIds, undefined);
+    assert.equal(h.cleared, 1);
     events = await h.run();
     assert.ok(events.some(event => event.status === 'uploaded'));
     assert.equal(h.adapters['coros-cn'].uploads.length, 2);
+    assert.equal(h.cleared, 1);
 
     const failed = await harness(t, { 'garmin-cn': [activity('garmin-cn', 'g2')], 'coros-cn': targets });
     failed.adapters['coros-cn'].onUpload = async () => ({ status: 'failed', code: 'COROS_STAGING_FAILED' });
@@ -378,6 +380,7 @@ test('transient staging failures retry next run and all definite failures releas
     task = Object.values(failed.state.transfers)[0];
     assert.equal(task.status, 'failed');
     assert.equal(task.beforeIds, undefined);
+    assert.equal(failed.cleared, 1);
 });
 
 test('a COROS rate limit stops the current batch after one staging attempt', async t => {
@@ -389,6 +392,7 @@ test('a COROS rate limit stops the current batch after one staging attempt', asy
     assert.equal(h.adapters['coros-cn'].uploads.length, 1);
     assert.equal(events.filter(event => event.status === 'deferred' && event.code === 'RATE_LIMIT').length, 1);
     assert.equal(Object.keys(h.state.transfers).length, 1);
+    assert.equal(h.cleared, 1);
 });
 
 test('checkpoint failure before COROS staging prevents the external write', async t => {

@@ -523,6 +523,7 @@ export class ActivitySynchronizer {
                 task.code = task.receipt.code;
                 if (['failed', 'pending'].includes(task.status)) task.beforeIds = undefined;
                 await this.save();
+                if (['retryable', 'failed'].includes(task.receipt.status)) await this.deps.clearIntent();
                 if (task.receipt.status === 'retryable') {
                     await fs.rm(uploadPath, { force: true });
                     this.event(route.name, source, 'deferred', { code: task.code });
