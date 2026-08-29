@@ -14,17 +14,16 @@ const { activity, evidence, hash } = require('./helpers.cjs');
 const LOCK_REF = 'refs/heads/codex/garmin-db-writer-lock';
 const AES_KEY = 'test-aes-key';
 
-function uploadIntent() {
+function uploadIntent(sourceId = 'g1', attempt = '00000000-0000-4000-8000-000000000000') {
     const state = emptyState();
     state.accounts['garmin-cn'] = hash('garmin-cn');
     state.accounts['coros-cn'] = hash('coros-cn');
-    const source = activity('garmin-cn', 'g1');
-    const canonical = 'canonical_1';
-    state.activities['garmin-cn:g1'] = { activity: source, canonical, missing: 0, evidence: evidence(source) };
+    const source = activity('garmin-cn', sourceId);
+    const canonical = `canonical_${sourceId}`;
+    state.activities[`garmin-cn:${sourceId}`] = { activity: source, canonical, missing: 0, evidence: evidence(source) };
     const transfer = state.transfers[`${canonical}:coros-cn`] = {
         canonical, source: 'garmin-cn', sourceId: source.id, target: 'coros-cn', status: 'uploading',
-        attempt: '00000000-0000-4000-8000-000000000000',
-        filename: 'dailysync_00000000-0000-4000-8000-000000000000.fit', createdAt: 1,
+        attempt, filename: `dailysync_${attempt}.fit`, createdAt: 1,
         evidence: evidence(source), beforeIds: [],
     };
     return createUploadIntent(state, transfer);
@@ -72,7 +71,7 @@ async function fixture(t) {
     return { work, remote, env, lockCommit };
 }
 
-test('Action upload intents are compact commits that leave the full Garmin database unstaged', async t => {
+test('Action upload intents atomically checkpoint the Garmin database and their deletion', async t => {
     const f = await fixture(t);
     const before = remoteHash(f.work, 'refs/heads/feature');
     await fs.writeFile(path.join(f.work, 'db', 'garmin.db'), 'large local state checkpoint');
@@ -82,33 +81,52 @@ test('Action upload intents are compact commits that leave the full Garmin datab
     const after = remoteHash(f.work, 'refs/heads/feature');
     assert.notEqual(after, before);
     assert.equal(after, git(f.work, ['rev-parse', 'HEAD']));
-    assert.equal(git(f.work, ['--git-dir', f.remote, 'show', `${after}:db/garmin.db`]), 'initial');
+    assert.equal(git(f.work, ['--git-dir', f.remote, 'show', `${after}:db/garmin.db`]), 'large local state checkpoint');
     const encrypted = git(f.work, ['--git-dir', f.remote, 'show', `${after}:${UPLOAD_INTENT_PATH}`]);
     assert.equal(encrypted.includes('garmin-cn'), false);
     assert.ok(Buffer.byteLength(encrypted) < 4096);
     assert.equal((await readUploadIntent(f.work, AES_KEY)).transfer.status, 'uploading');
     assert.equal(git(f.work, ['show', '-s', '--format=%s', after]), 'Save COROS Upload Intent');
     assert.equal(remoteHash(f.work, LOCK_REF), f.lockCommit);
-    assert.equal(git(f.work, ['status', '--porcelain']), 'M db/garmin.db');
+    assert.equal(git(f.work, ['status', '--porcelain']), '');
     await assertRemoteGarminDbLock(f.work, f.env);
 
+    await fs.writeFile(path.join(f.work, 'db', 'garmin.db'), 'retryable local state checkpoint');
     await clearCorosUploadIntent(f.work, f.env);
 
     const cleared = remoteHash(f.work, 'refs/heads/feature');
     assert.notEqual(cleared, after);
     assert.equal(cleared, git(f.work, ['rev-parse', 'HEAD']));
     assert.equal(git(f.work, ['--git-dir', f.remote, 'ls-tree', '--name-only', cleared, UPLOAD_INTENT_PATH]), '');
-    assert.equal(git(f.work, ['--git-dir', f.remote, 'show', `${cleared}:db/garmin.db`]), 'initial');
+    assert.equal(git(f.work, ['--git-dir', f.remote, 'show', `${cleared}:db/garmin.db`]), 'retryable local state checkpoint');
     assert.equal(git(f.work, ['show', '-s', '--format=%s', cleared]), 'Clear COROS Upload Intent');
     assert.equal(remoteHash(f.work, LOCK_REF), f.lockCommit);
-    assert.equal(git(f.work, ['status', '--porcelain']), 'M db/garmin.db');
+    assert.equal(git(f.work, ['status', '--porcelain']), '');
 
     await clearCorosUploadIntent(f.work, f.env);
     assert.equal(remoteHash(f.work, 'refs/heads/feature'), cleared);
 });
 
+test('replacing an upload intent checkpoints prior completed mappings', async t => {
+    const f = await fixture(t);
+    await fs.writeFile(path.join(f.work, 'db', 'garmin.db'), 'first activity uploading');
+    await publishCorosUploadIntent(f.work, uploadIntent(), f.env);
+
+    await fs.writeFile(path.join(f.work, 'db', 'garmin.db'), 'first activity complete; second activity uploading');
+    await publishCorosUploadIntent(f.work,
+        uploadIntent('g2', '00000000-0000-4000-8000-000000000001'), f.env);
+
+    const head = remoteHash(f.work, 'refs/heads/feature');
+    assert.equal(git(f.work, ['--git-dir', f.remote, 'show', `${head}:db/garmin.db`]),
+        'first activity complete; second activity uploading');
+    assert.equal((await readUploadIntent(f.work, AES_KEY)).source.activity.id, 'g2');
+    assert.equal(remoteHash(f.work, LOCK_REF), f.lockCommit);
+    assert.equal(git(f.work, ['status', '--porcelain']), '');
+});
+
 test('an empty Action AESKEY uses the original default for its upload intent', async t => {
     const f = await fixture(t);
+    await fs.writeFile(path.join(f.work, 'db', 'garmin.db'), 'uploading state');
     await publishCorosUploadIntent(f.work, uploadIntent(), { ...f.env, AESKEY: '' });
 
     assert.equal((await readUploadIntent(f.work, DEFAULT_AES_KEY)).transfer.status, 'uploading');
@@ -141,6 +159,7 @@ test('a concurrently advanced workflow branch rejects an intent before commit or
 
 test('a concurrently advanced workflow branch rejects an intent deletion', async t => {
     const f = await fixture(t);
+    await fs.writeFile(path.join(f.work, 'db', 'garmin.db'), 'uploading state');
     await publishCorosUploadIntent(f.work, uploadIntent(), f.env);
     const localHead = git(f.work, ['rev-parse', 'HEAD']);
     const tree = git(f.work, ['rev-parse', `${localHead}^{tree}`]);

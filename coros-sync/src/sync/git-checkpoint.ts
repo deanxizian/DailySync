@@ -5,6 +5,7 @@ import { clearUploadIntent, UPLOAD_INTENT_PATH, writeUploadIntent } from './uplo
 
 const DEFAULT_LOCK_REF = 'refs/heads/codex/garmin-db-writer-lock';
 const HASH = /^[a-f0-9]{40}(?:[a-f0-9]{24})?$/;
+const GARMIN_DB_PATH = 'db/garmin.db';
 
 interface ActionGitContext {
     branchRef: string;
@@ -61,6 +62,20 @@ function stagedPaths(root: string, context: ActionGitContext): string[] {
     return output(result).split('\0').filter(Boolean);
 }
 
+function stageStateAndIntent(root: string, context: ActionGitContext, action: string): void {
+    if (git(root, ['add', '--', GARMIN_DB_PATH, UPLOAD_INTENT_PATH], context.env).status !== 0) {
+        throw new SyncError('STATE_PUBLISH', `The COROS upload intent ${action} could not be staged.`);
+    }
+    const staged = stagedPaths(root, context);
+    if (staged.length !== 2 || !staged.includes(GARMIN_DB_PATH) || !staged.includes(UPLOAD_INTENT_PATH)) {
+        throw new SyncError('STATE_PUBLISH', `The COROS upload intent ${action} did not include an isolated database checkpoint.`);
+    }
+    const deleted = git(root, ['diff', '--cached', '--diff-filter=D', '--name-only', '--', GARMIN_DB_PATH], context.env);
+    if (deleted.status !== 0 || output(deleted).trim()) {
+        throw new SyncError('STATE_PUBLISH', 'The COROS state checkpoint cannot delete db/garmin.db.');
+    }
+}
+
 export async function assertRemoteGarminDbLock(root: string,
     environment: NodeJS.ProcessEnv = process.env): Promise<void> {
     const context = actionContext(root, environment);
@@ -87,13 +102,7 @@ export async function publishCorosUploadIntent(root: string, intent: UploadInten
     }
 
     await writeUploadIntent(root, intent, environment.AESKEY);
-    if (git(root, ['add', '--', UPLOAD_INTENT_PATH], context.env).status !== 0) {
-        throw new SyncError('STATE_PUBLISH', 'The COROS upload intent could not be staged.');
-    }
-    const staged = stagedPaths(root, context);
-    if (staged.length !== 1 || staged[0] !== UPLOAD_INTENT_PATH) {
-        throw new SyncError('STATE_PUBLISH', 'The COROS upload intent did not produce an isolated state change.');
-    }
+    stageStateAndIntent(root, context, 'publication');
     const commit = git(root, ['-c', 'user.name=github-actions[bot]',
         '-c', 'user.email=41898282+github-actions[bot]@users.noreply.github.com',
         '-c', 'commit.gpgsign=false', 'commit', '--no-verify', '-m', 'Save COROS Upload Intent'], context.env);
@@ -140,14 +149,7 @@ export async function clearCorosUploadIntent(root: string,
     if (tracked.status !== 0) {
         throw new SyncError('STATE_PUBLISH', 'Git could not inspect the COROS upload intent before clearing it.');
     }
-    if (git(root, ['add', '--', UPLOAD_INTENT_PATH], context.env).status !== 0) {
-        throw new SyncError('STATE_PUBLISH', 'The COROS upload intent deletion could not be staged.');
-    }
-    const staged = stagedPaths(root, context);
-    if (!staged.length) return;
-    if (staged.length !== 1 || staged[0] !== UPLOAD_INTENT_PATH) {
-        throw new SyncError('STATE_PUBLISH', 'The COROS upload intent deletion did not produce an isolated state change.');
-    }
+    stageStateAndIntent(root, context, 'deletion');
     const commit = git(root, ['-c', 'user.name=github-actions[bot]',
         '-c', 'user.email=41898282+github-actions[bot]@users.noreply.github.com',
         '-c', 'commit.gpgsign=false', 'commit', '--no-verify', '-m', 'Clear COROS Upload Intent'], context.env);
