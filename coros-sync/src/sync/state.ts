@@ -1,3 +1,5 @@
+import fs from 'fs/promises';
+import path from 'path';
 import { Database, open } from 'sqlite';
 import sqlite3 from 'sqlite3';
 import { activityKey, emptyState, ROUTES, SLOTS, SyncState, transferKey } from './types';
@@ -6,6 +8,37 @@ import { DEFAULT_AES_KEY } from './garmin-db';
 
 const CryptoJS = require('crypto-js');
 export const STATE_TABLE = 'coros_sync_state';
+
+const CREATE_STATE_TABLE = `
+    CREATE TABLE IF NOT EXISTS ${STATE_TABLE} (
+        id INTEGER PRIMARY KEY CHECK (id = 1),
+        payload TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    );
+`;
+
+export async function initializeStateDatabase(filename: string): Promise<void> {
+    let db: Database | undefined;
+    try {
+        try {
+            const stat = await fs.stat(filename);
+            if (!stat.isFile()) throw new Error();
+            return;
+        } catch (error) {
+            if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+        }
+        await fs.mkdir(path.dirname(filename), { recursive: true, mode: 0o700 });
+        db = await open({ filename, driver: sqlite3.Database,
+            mode: sqlite3.OPEN_READWRITE | sqlite3.OPEN_CREATE });
+        await db.exec(`PRAGMA journal_mode = DELETE; ${CREATE_STATE_TABLE}`);
+        await db.close();
+        db = undefined;
+        await fs.chmod(filename, 0o600);
+    } catch (_) {
+        await db?.close().catch(() => {});
+        throw new SyncError('STATE_SAVE', 'Cannot initialize the local COROS state database.');
+    }
+}
 
 export function validateState(state: SyncState): void {
     const fail = () => { throw new SyncError('STATE_INVALID', 'Shared state schema or activity mappings are invalid.'); };
@@ -62,7 +95,7 @@ function decryptState(payload: string, aesKey: string): SyncState {
         validateState(state);
         return state;
     } catch (_) {
-        throw new SyncError('STATE_INVALID', 'Cannot decrypt or validate COROS sync state in db/garmin.db. No uploads are allowed.');
+        throw new SyncError('STATE_INVALID', 'Cannot decrypt or validate the COROS sync state. No uploads are allowed.');
     }
 }
 
@@ -85,19 +118,12 @@ export class GarminDbState {
             const check = await db.get('PRAGMA integrity_check');
             if (!check || Object.values(check)[0] !== 'ok') throw new Error();
             if (writable) {
-                await db.exec(`
-                    PRAGMA journal_mode = DELETE;
-                    CREATE TABLE IF NOT EXISTS ${STATE_TABLE} (
-                        id INTEGER PRIMARY KEY CHECK (id = 1),
-                        payload TEXT NOT NULL,
-                        updated_at TEXT NOT NULL
-                    );
-                `);
+                await db.exec(`PRAGMA journal_mode = DELETE; ${CREATE_STATE_TABLE}`);
             }
             return new GarminDbState(db, writable, aesKey);
         } catch (_) {
             await db?.close();
-            throw new SyncError('GARMIN_DB_INVALID', 'Cannot open a valid db/garmin.db for COROS sync state.');
+            throw new SyncError('STATE_INVALID', 'Cannot open a valid COROS state database.');
         }
     }
 
@@ -113,12 +139,12 @@ export class GarminDbState {
             return state;
         } catch (error) {
             if (error instanceof SyncError) throw error;
-            throw new SyncError('STATE_INVALID', 'Cannot read COROS sync state from db/garmin.db. No uploads are allowed.');
+            throw new SyncError('STATE_INVALID', 'Cannot read the COROS sync state. No uploads are allowed.');
         }
     }
 
     async save(state: SyncState): Promise<void> {
-        if (!this.writable) throw new SyncError('STATE_SAVE', 'A read-only preview cannot update db/garmin.db.');
+        if (!this.writable) throw new SyncError('STATE_SAVE', 'A read-only run cannot update the COROS state database.');
         const serialized = serializeState(state);
         if (serialized === this.savedState) return;
         const payload = CryptoJS.AES.encrypt(serialized, this.aesKey).toString();
@@ -132,7 +158,7 @@ export class GarminDbState {
             this.savedState = serialized;
         } catch (_) {
             await this.db.exec('ROLLBACK');
-            throw new SyncError('STATE_SAVE', 'Cannot save COROS sync state to db/garmin.db. Further uploads stopped.');
+            throw new SyncError('STATE_SAVE', 'Cannot save the COROS sync state. Further uploads stopped.');
         }
     }
 

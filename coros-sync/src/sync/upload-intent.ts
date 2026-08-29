@@ -8,7 +8,8 @@ import { activityKey, emptyState, SLOTS, SyncState, transferKey, UploadIntent } 
 
 const CryptoJS = require('crypto-js');
 
-export const UPLOAD_INTENT_PATH = 'coros-sync/.upload-intent.enc';
+export const COROS_STATE_DB_PATH = 'coros-sync/.local/coros-state.db';
+export const UPLOAD_INTENT_PATH = 'coros-sync/.local/upload-intent.enc';
 const MAX_PLAINTEXT_BYTES = 256 * 1024;
 const MAX_ENCRYPTED_BYTES = 512 * 1024;
 
@@ -52,6 +53,19 @@ function effectiveAesKey(aesKey?: string): string {
     return aesKey || process.env.AESKEY || DEFAULT_AES_KEY;
 }
 
+export function decodeUploadIntent(payload: string, aesKey?: string): UploadIntent {
+    try {
+        if (Buffer.byteLength(payload) > MAX_ENCRYPTED_BYTES) throw new Error();
+        const plaintext = CryptoJS.AES.decrypt(payload, effectiveAesKey(aesKey)).toString(CryptoJS.enc.Utf8);
+        if (!plaintext || Buffer.byteLength(plaintext) > MAX_PLAINTEXT_BYTES) throw new Error();
+        const intent = JSON.parse(plaintext) as UploadIntent;
+        validateUploadIntent(intent);
+        return intent;
+    } catch (_) {
+        throw new SyncError('STATE_INVALID', 'Cannot decrypt or validate the durable COROS upload intent.');
+    }
+}
+
 export async function writeUploadIntent(root: string, intent: UploadIntent,
     aesKey?: string): Promise<void> {
     const filename = path.join(root, UPLOAD_INTENT_PATH);
@@ -77,16 +91,7 @@ export async function readUploadIntent(root: string,
         if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined;
         throw new SyncError('STATE_INVALID', 'Cannot read the durable COROS upload intent.');
     }
-    try {
-        if (Buffer.byteLength(payload) > MAX_ENCRYPTED_BYTES) throw new Error();
-        const plaintext = CryptoJS.AES.decrypt(payload, effectiveAesKey(aesKey)).toString(CryptoJS.enc.Utf8);
-        if (!plaintext || Buffer.byteLength(plaintext) > MAX_PLAINTEXT_BYTES) throw new Error();
-        const intent = JSON.parse(plaintext) as UploadIntent;
-        validateUploadIntent(intent);
-        return intent;
-    } catch (_) {
-        throw new SyncError('STATE_INVALID', 'Cannot decrypt or validate the durable COROS upload intent.');
-    }
+    return decodeUploadIntent(payload, aesKey);
 }
 
 export function mergeUploadIntent(state: SyncState, intent: UploadIntent): SyncState {

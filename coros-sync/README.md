@@ -26,6 +26,7 @@ GitHub Actions 工作流按平台要求保存在仓库根目录：
 
 - `.github/workflows/migrate_garmin_cn_to_coros.yml`
 - `.github/workflows/sync_garmin_cn_to_coros.yml`
+- `.github/workflows/manage_garmin_cn_to_coros.yml`
 - `.github/workflows/coros_sync_ci.yml`
 
 ## GitHub 配置
@@ -41,9 +42,9 @@ GitHub Actions 工作流按平台要求保存在仓库根目录：
 | `GARMIN_MIGRATE_AUTO_PAGE` | `true` | `true` 自动翻页，`false` 只处理一页 |
 | `COROS_USERNAME` | 无 | 高驰国区训练中心账号 |
 | `COROS_PASSWORD` | 无 | 高驰国区训练中心密码 |
-| `AESKEY` | 原项目默认值 | 现有 `garmin.db` 使用自定义密钥时必须保持一致 |
+| `AESKEY` | 原项目默认值 | 佳明 Session 与高驰同步状态使用自定义密钥时必须保持一致 |
 
-这两个 Action 不使用 `GARMIN_PASSWORD`、佳明国际区凭据或 Session JSON。佳明访问只使用 `db/garmin.db` 中已有的 OAuth Session。
+这些 Action 不使用 `GARMIN_PASSWORD`、佳明国际区凭据或 Session JSON。佳明访问只使用 `db/garmin.db` 中已有的 OAuth Session。
 
 ## GitHub Actions
 
@@ -51,8 +52,11 @@ GitHub Actions 工作流按平台要求保存在仓库根目录：
 |---|---|---|
 | **Migrate Garmin CN to COROS CN** | 手动 | 历史活动迁移 |
 | **Sync Garmin CN to COROS CN** | 手动、每 6 小时 | 新增活动同步和指定活动处理 |
+| **Manage Garmin CN to COROS CN State** | 手动 | 初始化或查看状态，以及关联、忽略或重试指定活动 |
 
 迁移 Action 仅支持手动触发；日常同步 Action 支持手动触发，并按计划自动运行。
+
+为保证 Actions 与人工维护使用同一份活动映射，写入和状态维护仅通过上述 Action 执行；本地命令只提供只读同步预览。
 
 日常同步可以填写 `activity_id`，只处理指定的一条佳明活动。
 
@@ -60,4 +64,4 @@ GitHub Actions 工作流按平台要求保存在仓库根目录：
 
 日常同步使用 `GARMIN_SYNC_NUM` 控制每页读取数量，不限制本轮同步总数。定时任务在北京时间 **04:00、10:00、16:00、22:00** 运行，与佳明同步任务间隔 2 小时。
 
-所有会写入 `db/garmin.db` 的佳明与高驰任务使用同一个远端 Git 互斥锁。等待中的 Action 不会被后来的任务替换；取得锁后会读取所在分支的最新数据库。每次向高驰写入前会先把一份有大小上限的加密上传意图提交到当前分支，任务结束后一次性提交 `db/garmin.db` 并清除该意图。
+佳明与高驰任务使用同一个远端 Git 互斥锁。高驰工具只读正式分支中的 `db/garmin.db`，不会修改它；活动映射和加密上传意图保存在独立的 `codex/coros-sync-state` 状态分支。该分支每次只保留一个无父提交的最新快照，初始化标记保存在固定引用中；两者都不累积运行历史，也不会向 `main` 写入 Action 产物。

@@ -5,9 +5,13 @@ const fs = require('node:fs/promises');
 const os = require('node:os');
 const path = require('node:path');
 const { execFileSync } = require('node:child_process');
-const { assertRemoteGarminDbLock, clearCorosUploadIntent, publishCorosUploadIntent } = require('../../src/sync/git-checkpoint');
-const { createUploadIntent, readUploadIntent, UPLOAD_INTENT_PATH } = require('../../src/sync/upload-intent');
+const { assertRemoteGarminDbLock, clearCorosUploadIntent, COROS_STATE_MARKER_REF, COROS_STATE_REF,
+    initializeCorosState, publishCorosUploadIntent, restoreCorosState } = require('../../src/sync/git-checkpoint');
+const { COROS_STATE_DB_PATH, createUploadIntent, readUploadIntent,
+    UPLOAD_INTENT_PATH } = require('../../src/sync/upload-intent');
 const { DEFAULT_AES_KEY } = require('../../src/sync/garmin-db');
+const { GarminDbState, initializeStateDatabase } = require('../../src/sync/state');
+const { LEGACY_UPLOAD_INTENT_PATH } = require('../../src/sync/legacy-state');
 const { emptyState } = require('../../src/sync/types');
 const { activity, evidence, hash } = require('./helpers.cjs');
 
@@ -29,6 +33,22 @@ function uploadIntent(sourceId = 'g1', attempt = '00000000-0000-4000-8000-000000
     return createUploadIntent(state, transfer);
 }
 
+function legacyUploadingState() {
+    const state = emptyState();
+    state.accounts['garmin-cn'] = hash('garmin-cn');
+    state.accounts['coros-cn'] = hash('coros-cn');
+    const source = activity('garmin-cn', 'legacy');
+    const canonical = 'legacy_canonical';
+    state.activities[`garmin-cn:${source.id}`] = { activity: source, canonical, missing: 0, evidence: evidence(source) };
+    const transfer = state.transfers[`${canonical}:coros-cn`] = {
+        canonical, source: 'garmin-cn', sourceId: source.id, target: 'coros-cn', status: 'uploading',
+        attempt: '00000000-0000-4000-8000-000000000009',
+        filename: 'dailysync_00000000-0000-4000-8000-000000000009.fit', createdAt: 1,
+        evidence: evidence(source), beforeIds: [],
+    };
+    return { state, intent: createUploadIntent(state, transfer) };
+}
+
 function git(cwd, args, options = {}) {
     return execFileSync('git', args, { cwd, encoding: 'utf8',
         env: { ...process.env, ...(options.env ?? {}) }, input: options.input }).trim();
@@ -45,7 +65,24 @@ function remoteHash(work, ref) {
     return git(work, ['ls-remote', '--exit-code', 'origin', ref]).split(/\s+/)[0];
 }
 
-async function fixture(t) {
+function rootSnapshot(work, state, intent, extra) {
+    const entries = [];
+    for (const [name, content] of [['coros-state.db', state], ['upload-intent.enc', intent], ['extra', extra]]) {
+        if (content === undefined) continue;
+        const blob = git(work, ['hash-object', '-w', '--stdin'], { input: content });
+        entries.push(`100644 blob ${blob}\t${name}`);
+    }
+    const tree = git(work, ['mktree'], { input: `${entries.sort().join('\n')}\n` });
+    return git(work, ['commit-tree', tree, '-m', 'test COROS state'], { env: identity() });
+}
+
+function markerSnapshot(work, payload = 'dailysync-coros-sync-state-v1\n') {
+    const blob = git(work, ['hash-object', '-w', '--stdin'], { input: payload });
+    const tree = git(work, ['mktree'], { input: `100644 blob ${blob}\tinitialized\n` });
+    return git(work, ['commit-tree', tree, '-m', 'test COROS marker'], { env: identity() });
+}
+
+async function fixture(t, options = {}) {
     const base = await fs.mkdtemp(path.join(os.tmpdir(), 'dailysync-git-checkpoint-'));
     const remote = path.join(base, 'remote.git');
     const work = path.join(base, 'work');
@@ -57,180 +94,231 @@ async function fixture(t) {
     git(work, ['checkout', '-b', 'feature']);
     git(work, ['config', 'user.name', 'DailySync Test']);
     git(work, ['config', 'user.email', 'test@example.invalid']);
-    await fs.mkdir(path.join(work, 'db'));
-    await fs.writeFile(path.join(work, 'db', 'garmin.db'), 'initial');
-    git(work, ['add', 'db/garmin.db']);
-    git(work, ['commit', '-m', 'Initial database']);
+    await fs.writeFile(path.join(work, 'README.md'), 'project history');
+    await fs.writeFile(path.join(work, '.gitignore'), 'coros-sync/.local/\n');
+    git(work, ['add', 'README.md', '.gitignore']);
+    git(work, ['commit', '-m', 'Initial project']);
     git(work, ['remote', 'add', 'origin', remote]);
     git(work, ['push', 'origin', 'HEAD:refs/heads/feature']);
 
     const emptyTree = git(work, ['mktree'], { input: '' });
     const lockCommit = git(work, ['commit-tree', emptyTree, '-m', 'test lock'], { env: identity() });
     git(work, ['push', 'origin', `${lockCommit}:${LOCK_REF}`]);
-    const env = { GITHUB_ACTIONS: 'true', GITHUB_REF_NAME: 'feature', GARMIN_DB_LOCK_COMMIT: lockCommit, AESKEY: AES_KEY };
-    return { work, remote, env, lockCommit };
+    const stateCommit = rootSnapshot(work, options.state ?? 's'.repeat(4096), options.intent, options.extra);
+    if (options.stateRef !== false) git(work, ['push', 'origin', `${stateCommit}:${COROS_STATE_REF}`]);
+    const markerCommit = markerSnapshot(work, options.markerPayload);
+    if (options.markerRef !== false) git(work, ['push', 'origin', `${markerCommit}:${COROS_STATE_MARKER_REF}`]);
+    const env = { GITHUB_ACTIONS: 'true', GARMIN_DB_LOCK_COMMIT: lockCommit, AESKEY: AES_KEY };
+    if (options.restore !== false) await restoreCorosState(work, env);
+    return { work, remote, env, lockCommit, stateCommit, markerCommit };
 }
 
-test('Action upload intents atomically checkpoint the Garmin database and their deletion', async t => {
+test('Action snapshots never advance project history and always replace the state root commit', async t => {
     const f = await fixture(t);
-    const before = remoteHash(f.work, 'refs/heads/feature');
-    await fs.writeFile(path.join(f.work, 'db', 'garmin.db'), 'large local state checkpoint');
+    const projectHead = remoteHash(f.work, 'refs/heads/feature');
+    const localHead = git(f.work, ['rev-parse', 'HEAD']);
+    await fs.writeFile(path.join(f.work, COROS_STATE_DB_PATH), 'first checkpoint'.repeat(300));
 
     await publishCorosUploadIntent(f.work, uploadIntent(), f.env);
 
-    const after = remoteHash(f.work, 'refs/heads/feature');
-    assert.notEqual(after, before);
-    assert.equal(after, git(f.work, ['rev-parse', 'HEAD']));
-    assert.equal(git(f.work, ['--git-dir', f.remote, 'show', `${after}:db/garmin.db`]), 'large local state checkpoint');
-    const encrypted = git(f.work, ['--git-dir', f.remote, 'show', `${after}:${UPLOAD_INTENT_PATH}`]);
+    const uploading = remoteHash(f.work, COROS_STATE_REF);
+    assert.notEqual(uploading, f.stateCommit);
+    assert.equal(remoteHash(f.work, 'refs/heads/feature'), projectHead);
+    assert.equal(git(f.work, ['rev-parse', 'HEAD']), localHead);
+    assert.equal(git(f.work, ['rev-list', '--parents', '-n', '1', uploading]).split(/\s+/).length, 1);
+    assert.equal(git(f.work, ['rev-list', '--count', uploading]), '1');
+    assert.deepEqual(git(f.work, ['ls-tree', '-r', '--name-only', uploading]).split('\n'),
+        ['coros-state.db', 'upload-intent.enc']);
+    assert.equal(git(f.work, ['--git-dir', f.remote, 'show', `${uploading}:coros-state.db`]),
+        'first checkpoint'.repeat(300));
+    const encrypted = git(f.work, ['--git-dir', f.remote, 'show', `${uploading}:upload-intent.enc`]);
     assert.equal(encrypted.includes('garmin-cn'), false);
-    assert.ok(Buffer.byteLength(encrypted) < 4096);
     assert.equal((await readUploadIntent(f.work, AES_KEY)).transfer.status, 'uploading');
-    assert.equal(git(f.work, ['show', '-s', '--format=%s', after]), 'Save COROS Upload Intent');
-    assert.equal(remoteHash(f.work, LOCK_REF), f.lockCommit);
-    assert.equal(git(f.work, ['status', '--porcelain']), '');
     await assertRemoteGarminDbLock(f.work, f.env);
 
-    await fs.writeFile(path.join(f.work, 'db', 'garmin.db'), 'retryable local state checkpoint');
+    await fs.writeFile(path.join(f.work, COROS_STATE_DB_PATH), 'completed checkpoint'.repeat(300));
     await clearCorosUploadIntent(f.work, f.env);
 
-    const cleared = remoteHash(f.work, 'refs/heads/feature');
-    assert.notEqual(cleared, after);
-    assert.equal(cleared, git(f.work, ['rev-parse', 'HEAD']));
-    assert.equal(git(f.work, ['--git-dir', f.remote, 'ls-tree', '--name-only', cleared, UPLOAD_INTENT_PATH]), '');
-    assert.equal(git(f.work, ['--git-dir', f.remote, 'show', `${cleared}:db/garmin.db`]), 'retryable local state checkpoint');
-    assert.equal(git(f.work, ['show', '-s', '--format=%s', cleared]), 'Clear COROS Upload Intent');
-    assert.equal(remoteHash(f.work, LOCK_REF), f.lockCommit);
+    const completed = remoteHash(f.work, COROS_STATE_REF);
+    assert.notEqual(completed, uploading);
+    assert.equal(git(f.work, ['rev-list', '--count', completed]), '1');
+    assert.equal(git(f.work, ['ls-tree', '-r', '--name-only', completed]), 'coros-state.db');
+    assert.equal(git(f.work, ['--git-dir', f.remote, 'show', `${completed}:coros-state.db`]),
+        'completed checkpoint'.repeat(300));
+    assert.equal(remoteHash(f.work, 'refs/heads/feature'), projectHead);
+    assert.equal(git(f.work, ['rev-parse', 'HEAD']), localHead);
     assert.equal(git(f.work, ['status', '--porcelain']), '');
-
-    await clearCorosUploadIntent(f.work, f.env);
-    assert.equal(remoteHash(f.work, 'refs/heads/feature'), cleared);
 });
 
-test('replacing an upload intent checkpoints prior completed mappings', async t => {
+test('a later intent snapshot includes all state completed before the next upload', async t => {
     const f = await fixture(t);
-    await fs.writeFile(path.join(f.work, 'db', 'garmin.db'), 'first activity uploading');
+    await fs.writeFile(path.join(f.work, COROS_STATE_DB_PATH), 'first activity uploading'.repeat(200));
     await publishCorosUploadIntent(f.work, uploadIntent(), f.env);
 
-    await fs.writeFile(path.join(f.work, 'db', 'garmin.db'), 'first activity complete; second activity uploading');
+    await fs.writeFile(path.join(f.work, COROS_STATE_DB_PATH),
+        'first activity complete; second activity uploading'.repeat(200));
     await publishCorosUploadIntent(f.work,
         uploadIntent('g2', '00000000-0000-4000-8000-000000000001'), f.env);
 
-    const head = remoteHash(f.work, 'refs/heads/feature');
-    assert.equal(git(f.work, ['--git-dir', f.remote, 'show', `${head}:db/garmin.db`]),
-        'first activity complete; second activity uploading');
+    const state = remoteHash(f.work, COROS_STATE_REF);
+    assert.equal(git(f.work, ['--git-dir', f.remote, 'show', `${state}:coros-state.db`]),
+        'first activity complete; second activity uploading'.repeat(200));
     assert.equal((await readUploadIntent(f.work, AES_KEY)).source.activity.id, 'g2');
-    assert.equal(remoteHash(f.work, LOCK_REF), f.lockCommit);
-    assert.equal(git(f.work, ['status', '--porcelain']), '');
+    assert.equal(git(f.work, ['rev-list', '--count', state]), '1');
 });
 
-test('an empty Action AESKEY uses the original default for its upload intent', async t => {
+test('an empty Action AESKEY keeps compatibility with the original default key', async t => {
     const f = await fixture(t);
-    await fs.writeFile(path.join(f.work, 'db', 'garmin.db'), 'uploading state');
+    await fs.writeFile(path.join(f.work, COROS_STATE_DB_PATH), 'uploading state'.repeat(300));
     await publishCorosUploadIntent(f.work, uploadIntent(), { ...f.env, AESKEY: '' });
-
     assert.equal((await readUploadIntent(f.work, DEFAULT_AES_KEY)).transfer.status, 'uploading');
 });
 
-test('a missing remote lock rejects an intent before changing branch history', async t => {
+test('a missing remote lock rejects snapshots before local or remote state changes', async t => {
     const f = await fixture(t);
-    const branch = remoteHash(f.work, 'refs/heads/feature');
-    await fs.writeFile(path.join(f.work, 'db', 'garmin.db'), 'must not publish');
+    const state = remoteHash(f.work, COROS_STATE_REF);
     const env = { ...f.env, GARMIN_DB_LOCK_COMMIT: 'a'.repeat(40) };
-
     await assert.rejects(assertRemoteGarminDbLock(f.work, env), { code: 'LOCK_LOST' });
     await assert.rejects(publishCorosUploadIntent(f.work, uploadIntent(), env), { code: 'LOCK_LOST' });
-    assert.equal(remoteHash(f.work, 'refs/heads/feature'), branch);
-    assert.equal(git(f.work, ['rev-parse', 'HEAD']), branch);
+    assert.equal(remoteHash(f.work, COROS_STATE_REF), state);
+    await assert.rejects(fs.stat(path.join(f.work, UPLOAD_INTENT_PATH)), { code: 'ENOENT' });
 });
 
-test('a rejected intent push never advances local history or leaks into the later state commit', async t => {
+test('a rejected snapshot push leaves project history and remote state unchanged', async t => {
     const f = await fixture(t);
-    const before = remoteHash(f.work, 'refs/heads/feature');
-    await fs.writeFile(path.join(f.work, 'db', 'garmin.db'), 'uploading state');
+    const project = remoteHash(f.work, 'refs/heads/feature');
+    const state = remoteHash(f.work, COROS_STATE_REF);
+    await fs.writeFile(path.join(f.work, COROS_STATE_DB_PATH), 'must not publish'.repeat(300));
     const hook = path.join(f.remote, 'hooks', 'pre-receive');
     await fs.writeFile(hook, '#!/bin/sh\nexit 1\n');
     await fs.chmod(hook, 0o755);
 
     await assert.rejects(publishCorosUploadIntent(f.work, uploadIntent(), f.env), { code: 'STATE_PUBLISH' });
-    await fs.unlink(hook);
 
-    assert.equal(git(f.work, ['rev-parse', 'HEAD']), before);
-    assert.equal(remoteHash(f.work, 'refs/heads/feature'), before);
-    assert.equal(git(f.work, ['diff', '--cached', '--name-only']), '');
-    assert.equal(git(f.work, ['ls-files', UPLOAD_INTENT_PATH]), '');
-    await fs.access(path.join(f.work, UPLOAD_INTENT_PATH));
-
-    await fs.writeFile(path.join(f.work, 'db', 'garmin.db'), 'pending rollback state');
-    await clearCorosUploadIntent(f.work, f.env);
-    await assert.rejects(fs.access(path.join(f.work, UPLOAD_INTENT_PATH)));
-    git(f.work, ['add', 'db/garmin.db']);
-    git(f.work, ['commit', '-m', 'Save rollback state']);
-    git(f.work, ['push', 'origin', 'HEAD:refs/heads/feature']);
-
-    const after = remoteHash(f.work, 'refs/heads/feature');
-    assert.equal(git(f.work, ['--git-dir', f.remote, 'ls-tree', '--name-only', after, UPLOAD_INTENT_PATH]), '');
-    assert.equal(git(f.work, ['--git-dir', f.remote, 'show', `${after}:db/garmin.db`]), 'pending rollback state');
-});
-
-test('an accepted intent is rolled back when the local branch cannot follow its remote commit', async t => {
-    const f = await fixture(t);
-    const before = remoteHash(f.work, 'refs/heads/feature');
-    const gitDirectory = path.resolve(f.work, git(f.work, ['rev-parse', '--git-dir']));
-    const branchLock = path.join(gitDirectory, 'refs', 'heads', 'feature.lock');
-    await fs.writeFile(path.join(f.work, 'db', 'garmin.db'), 'uploading state');
-    await fs.writeFile(branchLock, 'prevent local ref update');
-
-    await assert.rejects(publishCorosUploadIntent(f.work, uploadIntent(), f.env), { code: 'STATE_PUBLISH' });
-
-    const intentCommit = remoteHash(f.work, 'refs/heads/feature');
-    assert.notEqual(intentCommit, before);
-    assert.equal(git(f.work, ['rev-parse', 'HEAD']), before);
-    assert.equal(git(f.work, ['show', '-s', '--format=%s', intentCommit]), 'Save COROS Upload Intent');
-    assert.ok(git(f.work, ['--git-dir', f.remote, 'show', `${intentCommit}:${UPLOAD_INTENT_PATH}`]));
-
-    await fs.unlink(branchLock);
-    await fs.writeFile(path.join(f.work, 'db', 'garmin.db'), 'pending rollback state');
-    await clearCorosUploadIntent(f.work, f.env);
-
-    const cleared = remoteHash(f.work, 'refs/heads/feature');
-    assert.equal(git(f.work, ['rev-parse', 'HEAD']), cleared);
-    assert.equal(git(f.work, ['rev-parse', `${cleared}^^`]), before);
-    assert.equal(git(f.work, ['--git-dir', f.remote, 'ls-tree', '--name-only', cleared, UPLOAD_INTENT_PATH]), '');
-    assert.equal(git(f.work, ['--git-dir', f.remote, 'show', `${cleared}:db/garmin.db`]), 'pending rollback state');
+    assert.equal(remoteHash(f.work, COROS_STATE_REF), state);
+    assert.equal(remoteHash(f.work, 'refs/heads/feature'), project);
     assert.equal(git(f.work, ['status', '--porcelain']), '');
 });
 
-test('a concurrently advanced workflow branch rejects an intent before commit or upload', async t => {
+test('a concurrent state replacement is never overwritten', async t => {
     const f = await fixture(t);
-    const localHead = git(f.work, ['rev-parse', 'HEAD']);
-    const tree = git(f.work, ['rev-parse', `${localHead}^{tree}`]);
-    const advanced = git(f.work, ['commit-tree', tree, '-p', localHead, '-m', 'Concurrent update'], { env: identity() });
-    git(f.work, ['push', 'origin', `${advanced}:refs/heads/feature`]);
-    await fs.writeFile(path.join(f.work, 'db', 'garmin.db'), 'must not publish');
+    const concurrent = rootSnapshot(f.work, 'concurrent state'.repeat(300));
+    git(f.work, ['push', '--force', 'origin', `${concurrent}:${COROS_STATE_REF}`]);
+    await fs.writeFile(path.join(f.work, COROS_STATE_DB_PATH), 'stale local state'.repeat(300));
 
-    await assert.rejects(publishCorosUploadIntent(f.work, uploadIntent(), f.env), { code: 'STATE_PUBLISH' });
-    assert.equal(git(f.work, ['rev-parse', 'HEAD']), localHead);
-    assert.equal(remoteHash(f.work, 'refs/heads/feature'), advanced);
+    await assert.rejects(publishCorosUploadIntent(f.work, uploadIntent(), f.env), { code: 'STATE_CONFLICT' });
+    assert.equal(remoteHash(f.work, COROS_STATE_REF), concurrent);
 });
 
-test('a concurrently advanced workflow branch rejects an intent deletion', async t => {
-    const f = await fixture(t);
-    await fs.writeFile(path.join(f.work, 'db', 'garmin.db'), 'uploading state');
-    await publishCorosUploadIntent(f.work, uploadIntent(), f.env);
-    const localHead = git(f.work, ['rev-parse', 'HEAD']);
-    const tree = git(f.work, ['rev-parse', `${localHead}^{tree}`]);
-    const advanced = git(f.work, ['commit-tree', tree, '-p', localHead, '-m', 'Concurrent update'], { env: identity() });
-    git(f.work, ['push', 'origin', `${advanced}:refs/heads/feature`]);
+test('explicit initialization migrates legacy state and publishes an immutable marker', async t => {
+    const f = await fixture(t, { restore: false, stateRef: false, markerRef: false });
+    const legacyDb = path.join(f.work, 'db', 'garmin.db');
+    await fs.mkdir(path.dirname(legacyDb), { recursive: true });
+    await initializeStateDatabase(legacyDb);
+    const legacy = legacyUploadingState();
+    const writer = await GarminDbState.open(legacyDb, true, AES_KEY);
+    try { await writer.save(legacy.state); } finally { await writer.close(); }
+    await fs.mkdir(path.join(f.work, 'coros-sync'), { recursive: true });
+    await fs.writeFile(path.join(f.work, LEGACY_UPLOAD_INTENT_PATH),
+        require('crypto-js').AES.encrypt(JSON.stringify(legacy.intent), AES_KEY).toString(), { mode: 0o600 });
+    const project = remoteHash(f.work, 'refs/heads/feature');
 
-    await assert.rejects(clearCorosUploadIntent(f.work, f.env), { code: 'STATE_PUBLISH' });
-    assert.equal(git(f.work, ['rev-parse', 'HEAD']), localHead);
-    assert.equal(remoteHash(f.work, 'refs/heads/feature'), advanced);
-    assert.ok(git(f.work, ['--git-dir', f.remote, 'show', `${advanced}:${UPLOAD_INTENT_PATH}`]));
+    await initializeCorosState(f.work, f.env);
+
+    const snapshot = remoteHash(f.work, COROS_STATE_REF);
+    const marker = remoteHash(f.work, COROS_STATE_MARKER_REF);
+    assert.equal(git(f.work, ['rev-list', '--count', snapshot]), '1');
+    assert.equal(git(f.work, ['rev-list', '--count', marker]), '1');
+    assert.equal(git(f.work, ['ls-tree', '-r', '--name-only', marker]), 'initialized');
+    assert.equal(git(f.work, ['show', `${marker}:initialized`]), 'dailysync-coros-sync-state-v1');
+    assert.deepEqual(git(f.work, ['ls-tree', '-r', '--name-only', snapshot]).split('\n'),
+        ['coros-state.db', 'upload-intent.enc']);
+    assert.equal(remoteHash(f.work, 'refs/heads/feature'), project);
+    await assert.rejects(initializeCorosState(f.work, f.env), { code: 'STATE_CONFLICT' });
 });
 
-test('local runs do not require a Git repository or remote lock', async () => {
-    await publishCorosUploadIntent('/path/that/does/not/exist', uploadIntent(), {});
-    await clearCorosUploadIntent('/path/that/does/not/exist', {});
-    await assertRemoteGarminDbLock('/path/that/does/not/exist', {});
+test('explicit initialization creates a valid empty state when no legacy state exists', async t => {
+    const f = await fixture(t, { restore: false, stateRef: false, markerRef: false });
+
+    await initializeCorosState(f.work, f.env);
+    await restoreCorosState(f.work, f.env);
+
+    const store = await GarminDbState.open(path.join(f.work, COROS_STATE_DB_PATH), false, AES_KEY);
+    try { assert.deepEqual(await store.load(), emptyState()); } finally { await store.close(); }
+    assert.equal(git(f.work, ['rev-list', '--count', remoteHash(f.work, COROS_STATE_REF)]), '1');
+    assert.equal(git(f.work, ['rev-list', '--count', remoteHash(f.work, COROS_STATE_MARKER_REF)]), '1');
+});
+
+test('a missing state ref fails closed even when verified legacy state remains', async t => {
+    const f = await fixture(t, { restore: false, stateRef: false });
+    const legacyDb = path.join(f.work, 'db', 'garmin.db');
+    await fs.mkdir(path.dirname(legacyDb), { recursive: true });
+    await initializeStateDatabase(legacyDb);
+    const legacy = legacyUploadingState();
+    const writer = await GarminDbState.open(legacyDb, true, AES_KEY);
+    try { await writer.save(legacy.state); } finally { await writer.close(); }
+    await fs.mkdir(path.join(f.work, 'coros-sync'), { recursive: true });
+    await fs.writeFile(path.join(f.work, LEGACY_UPLOAD_INTENT_PATH),
+        require('crypto-js').AES.encrypt(JSON.stringify(legacy.intent), AES_KEY).toString(), { mode: 0o600 });
+    const before = await fs.readFile(legacyDb);
+
+    const beforeIntent = await fs.readFile(path.join(f.work, LEGACY_UPLOAD_INTENT_PATH));
+
+    await assert.rejects(restoreCorosState(f.work, f.env), { code: 'STATE_MISSING' });
+    await assert.rejects(initializeCorosState(f.work, f.env), { code: 'STATE_MISSING' });
+
+    assert.equal(git(f.work, ['ls-remote', 'origin', COROS_STATE_REF]), '');
+    assert.deepEqual(await fs.readFile(legacyDb), before);
+    assert.deepEqual(await fs.readFile(path.join(f.work, LEGACY_UPLOAD_INTENT_PATH)), beforeIntent);
+    await assert.rejects(fs.stat(path.join(f.work, COROS_STATE_DB_PATH)), { code: 'ENOENT' });
+    await assert.rejects(fs.stat(path.join(f.work, UPLOAD_INTENT_PATH)), { code: 'ENOENT' });
+});
+
+test('restore rejects missing, parented, undersized and unexpected snapshots', async t => {
+    const missing = await fixture(t, { restore: false });
+    git(missing.work, ['push', 'origin', `:${COROS_STATE_REF}`]);
+    await assert.rejects(restoreCorosState(missing.work, missing.env), { code: 'STATE_MISSING' });
+
+    const parented = await fixture(t, { restore: false });
+    const tree = git(parented.work, ['rev-parse', `${parented.stateCommit}^{tree}`]);
+    const child = git(parented.work, ['commit-tree', tree, '-p', parented.stateCommit, '-m', 'invalid child'], { env: identity() });
+    git(parented.work, ['push', '--force', 'origin', `${child}:${COROS_STATE_REF}`]);
+    await assert.rejects(restoreCorosState(parented.work, parented.env), { code: 'STATE_INVALID' });
+
+    const small = await fixture(t, { restore: false, state: 'small' });
+    await assert.rejects(restoreCorosState(small.work, small.env), { code: 'STATE_INVALID' });
+
+    const extra = await fixture(t, { restore: false, extra: 'unexpected' });
+    await assert.rejects(restoreCorosState(extra.work, extra.env), { code: 'STATE_INVALID' });
+
+    const missingMarker = await fixture(t, { restore: false });
+    git(missingMarker.work, ['push', 'origin', `:${COROS_STATE_MARKER_REF}`]);
+    await assert.rejects(restoreCorosState(missingMarker.work, missingMarker.env), { code: 'STATE_MISSING' });
+
+    const invalidMarker = await fixture(t, { restore: false, markerPayload: 'wrong' });
+    await assert.rejects(restoreCorosState(invalidMarker.work, invalidMarker.env), { code: 'STATE_INVALID' });
+});
+
+test('local read-only restoration refreshes the latest shared snapshot', async t => {
+    const f = await fixture(t);
+    const replacement = rootSnapshot(f.work, 'latest shared state'.repeat(300));
+    git(f.work, ['push', '--force', 'origin', `${replacement}:${COROS_STATE_REF}`]);
+
+    await restoreCorosState(f.work, { AESKEY: AES_KEY });
+
+    assert.equal(await fs.readFile(path.join(f.work, COROS_STATE_DB_PATH), 'utf8'),
+        'latest shared state'.repeat(300));
+    assert.equal(remoteHash(f.work, COROS_STATE_REF), replacement);
+});
+
+test('Action publication requires restoration while local intent durability requires no Git remote', async t => {
+    const action = await fixture(t, { restore: false });
+    await assert.rejects(publishCorosUploadIntent(action.work, uploadIntent(), action.env), { code: 'STATE_MISSING' });
+
+    const local = await fs.mkdtemp(path.join(os.tmpdir(), 'dailysync-local-intent-'));
+    t.after(() => fs.rm(local, { recursive: true, force: true }));
+    await publishCorosUploadIntent(local, uploadIntent(), { AESKEY: AES_KEY });
+    assert.equal((await readUploadIntent(local, AES_KEY)).transfer.status, 'uploading');
+    await clearCorosUploadIntent(local, { AESKEY: AES_KEY });
+    await assert.rejects(fs.stat(path.join(local, UPLOAD_INTENT_PATH)), { code: 'ENOENT' });
 });

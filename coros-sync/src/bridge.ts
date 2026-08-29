@@ -16,7 +16,8 @@ const HELP: Record<BridgeProfile, string> = {
     migration: `DailySync historical migration: Garmin CN -> COROS CN
 
 pnpm --dir coros-sync migrate_garmin_cn_to_coros                   Read-only migration preview
-pnpm --dir coros-sync migrate_garmin_cn_to_coros --apply           Migrate the selected history batch
+
+Writes run only through the historical migration GitHub Action.
 
 Options: --migrate-start N, --time-budget SECONDS, --retry-failed, --json
 GARMIN_MIGRATE_START is 1-based with the newest activity at position 1; 0 also starts at the newest activity.
@@ -24,12 +25,8 @@ GARMIN_MIGRATE_START is 1-based with the newest activity at position 1; 0 also s
     sync: `DailySync activity sync: Garmin CN -> COROS CN
 
 pnpm --dir coros-sync sync_garmin_cn_to_coros                       Read-only recent sync preview
-pnpm --dir coros-sync sync_garmin_cn_to_coros --apply               Sync missing activities to COROS
-pnpm --dir coros-sync sync_garmin_cn_to_coros --activity-id ID --apply
-pnpm --dir coros-sync sync_garmin_cn_to_coros state                 Inspect mappings and unresolved imports
-pnpm --dir coros-sync sync_garmin_cn_to_coros link --source garmin-cn:ID --target coros-cn:ID
-pnpm --dir coros-sync sync_garmin_cn_to_coros ignore --source garmin-cn:ID --target coros-cn
-pnpm --dir coros-sync sync_garmin_cn_to_coros retry --source garmin-cn:ID --target coros-cn --confirm-not-imported
+
+Writes and shared-state maintenance run only through the corresponding GitHub Actions.
 
 Options: --activity-id ID, --time-budget SECONDS, --retry-failed, --json
 `,
@@ -83,8 +80,22 @@ export async function main(profile: BridgeProfile, args = process.argv.slice(2),
     validateProfile(profile, options);
     loadPrivateEnv(root);
     const write = options.command === 'sync' ? options.apply : ['link', 'ignore', 'retry'].includes(options.command);
+    if (process.env.GITHUB_ACTIONS !== 'true' && (write || options.command === 'state')) {
+        throw new SyncError('USAGE', 'COROS writes and shared-state maintenance must run through GitHub Actions.');
+    }
     if (['sync', 'link', 'ignore', 'retry'].includes(options.command)) requireBridgeAccounts(process.env);
-    const workspace = await SyncWorkspace.create(root);
+    let sourcePageSize = 10;
+    let sourceOffset = 0;
+    let sourceLimit: number | undefined;
+    if (options.command !== 'state') {
+        sourcePageSize = countSetting(profile === 'migration' ? 'GARMIN_MIGRATE_NUM' : 'GARMIN_SYNC_NUM',
+            profile === 'migration' ? 100 : 10);
+        if (profile === 'migration') {
+            sourceOffset = Math.max(0, migrationStartSetting(options.migrateStart) - 1);
+            if (!autoPageEnabled()) sourceLimit = sourcePageSize;
+        }
+    }
+    const workspace = await SyncWorkspace.create(root, true);
     let state: SyncState | undefined;
     let succeeded = false;
     try {
@@ -100,8 +111,6 @@ export async function main(profile: BridgeProfile, args = process.argv.slice(2),
         }
         const databaseSession = await readGarminCnSession(root, process.env.GARMIN_USERNAME!);
         state.sessions['garmin-cn'] = newerGarminSession(state.sessions['garmin-cn'], databaseSession);
-        const sourcePageSize = countSetting(profile === 'migration' ? 'GARMIN_MIGRATE_NUM' : 'GARMIN_SYNC_NUM',
-            profile === 'migration' ? 100 : 10);
         const adapters: Record<Slot, PlatformAdapter> = {
             'garmin-cn': new GarminCnReadOnlyAdapter(process.env.GARMIN_USERNAME!, undefined, undefined, sourcePageSize),
             'coros-cn': new CorosAdapter({ username: process.env.COROS_USERNAME!, password: process.env.COROS_PASSWORD! }),
@@ -117,8 +126,7 @@ export async function main(profile: BridgeProfile, args = process.argv.slice(2),
             emit: options.json ? undefined : event => {
                 if (event.status !== 'existing') console.log(`${event.source} ${event.status}${event.code ? ` (${event.code})` : ''}${event.candidates?.length ? ` candidates=${event.candidates.join(',')}` : ''}`);
             } }, { apply: write, activityId: options.activityId,
-                sourceOffset: profile === 'migration' ? Math.max(0, migrationStartSetting(options.migrateStart) - 1) : 0,
-                sourceLimit: profile === 'migration' && !autoPageEnabled() ? sourcePageSize : undefined,
+                sourceOffset, sourceLimit,
                 retryFailed: options.retryFailed, deadline: timeBudget ? Date.now() + timeBudget * 1000 : undefined });
         if (options.command !== 'sync') {
             const sourceRef = parseActivityReference(options.source!);
@@ -166,7 +174,10 @@ export async function main(profile: BridgeProfile, args = process.argv.slice(2),
             ['uploading', 'verifying', 'failed'].includes(task.status)));
         let cleanupFailure: unknown;
         if (succeeded && write) {
-            try { await workspace.clearUploadIntent(); } catch (error) { cleanupFailure = error; }
+            try {
+                await workspace.assertOwned();
+                await clearCorosUploadIntent(root);
+            } catch (error) { cleanupFailure = error; }
         }
         try { await workspace.close(keepFits); } catch (error) { cleanupFailure ??= error; }
         if (cleanupFailure) throw cleanupFailure;

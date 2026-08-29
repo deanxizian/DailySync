@@ -1,10 +1,12 @@
 import { randomUUID } from 'crypto';
 import fs from 'fs/promises';
 import path from 'path';
-import { GarminDbState } from './state';
+import { GarminDbState, initializeStateDatabase } from './state';
 import { emptyState, SyncState } from './types';
 import { SyncError } from './errors';
-import { clearUploadIntent, mergeUploadIntent, readUploadIntent } from './upload-intent';
+import { clearUploadIntent, COROS_STATE_DB_PATH, mergeUploadIntent, readUploadIntent } from './upload-intent';
+import { restoreCorosState } from './git-checkpoint';
+import { migrateLegacyCorosState } from './legacy-state';
 
 export class SyncWorkspace {
     private store?: GarminDbState;
@@ -14,12 +16,15 @@ export class SyncWorkspace {
     private constructor(readonly directory: string, private readonly root: string,
         private readonly database: string, private readonly lockFile: string) {}
 
-    static async create(root: string): Promise<SyncWorkspace> {
+    static async create(root: string, shared = false): Promise<SyncWorkspace> {
         const base = path.join(root, 'coros-sync', '.local');
         await fs.mkdir(base, { recursive: true, mode: 0o700 });
         await fs.chmod(base, 0o700);
+        const database = path.join(root, COROS_STATE_DB_PATH);
+        if (shared) await restoreCorosState(root);
+        else if (!await migrateLegacyCorosState(root)) await initializeStateDatabase(database);
         const directory = await fs.mkdtemp(path.join(base, 'run-'));
-        return new SyncWorkspace(directory, root, path.join(root, 'db', 'garmin.db'), path.join(base, 'write.lock'));
+        return new SyncWorkspace(directory, root, database, path.join(base, 'write.lock'));
     }
 
     private async acquireWriteLock(): Promise<void> {
@@ -70,7 +75,9 @@ export class SyncWorkspace {
             this.store = await GarminDbState.open(this.database, write);
             const saved = await this.store.load();
             const intent = await readUploadIntent(this.root);
-            if (!saved && !intent && !allowEmpty) throw new SyncError('STATE_MISSING', 'No COROS sync state exists in db/garmin.db.');
+            if (!saved && !intent && (!allowEmpty || (write && process.env.GITHUB_ACTIONS === 'true'))) {
+                throw new SyncError('STATE_MISSING', 'The shared COROS sync state is empty; uploads are disabled.');
+            }
             const state = saved ?? emptyState();
             return intent ? mergeUploadIntent(state, intent) : state;
         } catch (error) {
@@ -90,7 +97,7 @@ export class SyncWorkspace {
 
     async assertOwned(): Promise<void> {
         if (!this.writable || !this.store || !this.lockPayload) {
-            throw new SyncError('STATE_SAVE', 'The current run does not own a writable db/garmin.db state connection.');
+            throw new SyncError('STATE_SAVE', 'The current run does not own a writable COROS state connection.');
         }
         try {
             if (await fs.readFile(this.lockFile, 'utf8') !== this.lockPayload) throw new Error();

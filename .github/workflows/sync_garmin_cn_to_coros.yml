@@ -52,12 +52,6 @@ jobs:
           args=(--time-budget 2700 --apply)
           if [[ -n "$SYNC_ACTIVITY_ID" ]]; then args+=(--activity-id "$SYNC_ACTIVITY_ID"); fi
           pnpm --dir coros-sync sync_garmin_cn_to_coros "${args[@]}"
-      - name: Save COROS sync state
-        if: ${{ always() && steps.garmin_db_lock.outputs.acquired == 'true' }}
-        uses: stefanzweifel/git-auto-commit-action@v5
-        with:
-          commit_message: Save COROS Sync State
-          file_pattern: db/garmin.db coros-sync
       - name: Release Garmin database writer lock
         if: ${{ always() && steps.garmin_db_lock.outputs.acquired == 'true' }}
         env:

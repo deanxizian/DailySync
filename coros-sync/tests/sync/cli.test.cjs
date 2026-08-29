@@ -9,11 +9,13 @@ const { open } = require('sqlite');
 const CryptoJS = require('crypto-js');
 const { parseOptions, parseActivityReference, loadPrivateEnv, requireBridgeAccounts } = require('../../src/sync/config');
 const { SyncWorkspace } = require('../../src/sync/workspace');
-const { STATE_TABLE } = require('../../src/sync/state');
+const { GarminDbState, STATE_TABLE } = require('../../src/sync/state');
 const { main } = require('../../src/bridge');
 const { emptyState } = require('../../src/sync/types');
-const { createUploadIntent, writeUploadIntent, UPLOAD_INTENT_PATH } = require('../../src/sync/upload-intent');
+const { COROS_STATE_DB_PATH, createUploadIntent, writeUploadIntent,
+    UPLOAD_INTENT_PATH } = require('../../src/sync/upload-intent');
 const { activity, evidence, hash } = require('./helpers.cjs');
+const { LEGACY_UPLOAD_INTENT_PATH } = require('../../src/sync/legacy-state');
 
 const settings = ['COROS_USERNAME', 'COROS_PASSWORD', 'GARMIN_USERNAME', 'GARMIN_PASSWORD', 'AESKEY',
     'GARMIN_SYNC_NUM', 'GARMIN_MIGRATE_NUM', 'GARMIN_MIGRATE_START', 'GARMIN_MIGRATE_AUTO_PAGE',
@@ -66,6 +68,18 @@ test('migration and sync entry profiles reject each other\'s options', async () 
     await assert.rejects(main('sync', ['--migrate-start', '1']), { code: 'USAGE' });
 });
 
+test('local commands cannot write or maintain the shared Action state', async t => {
+    const { root } = await fixture(t);
+    for (const args of [['--apply'], ['--activity-id', '123', '--apply'], ['state'],
+        ['link', '--source', 'garmin-cn:1', '--target', 'coros-cn:2'],
+        ['ignore', '--source', 'garmin-cn:1', '--target', 'coros-cn'],
+        ['retry', '--source', 'garmin-cn:1', '--target', 'coros-cn', '--confirm-not-imported']]) {
+        await assert.rejects(main('sync', args, root), { code: 'USAGE' }, JSON.stringify(args));
+    }
+    await assert.rejects(main('migration', ['--apply'], root), { code: 'USAGE' });
+    await assert.rejects(fs.stat(path.join(root, 'coros-sync')), { code: 'ENOENT' });
+});
+
 test('private env file is permission-checked and never requires a Garmin password', async t => {
     const { root } = await fixture(t);
     await fs.mkdir(path.join(root, 'coros-sync'));
@@ -84,7 +98,7 @@ test('private env file is permission-checked and never requires a Garmin passwor
     assert.throws(() => requireBridgeAccounts({ GARMIN_USERNAME: 'x' }), error => error.code === 'CONFIG' && error.message.includes('COROS_PASSWORD'));
 });
 
-test('workspace previews read-only and persists apply state inside the tracked Garmin database', async t => {
+test('workspace keeps COROS apply state outside the tracked Garmin database', async t => {
     const { root } = await fixture(t);
     process.env.AESKEY = 'test-key';
     await createGarminDb(root, 'garmin@example.invalid', process.env.AESKEY);
@@ -104,10 +118,12 @@ test('workspace previews read-only and persists apply state inside the tracked G
 
     const reader = await SyncWorkspace.create(root);
     try { assert.equal((await reader.load(false)).accounts['coros-cn'], 'a'.repeat(64)); } finally { await reader.close(); }
-    const db = await open({ filename, driver: sqlite3.Database, mode: sqlite3.OPEN_READONLY });
+    assert.deepEqual(await fs.readFile(filename), before);
+    const stateFilename = path.join(root, COROS_STATE_DB_PATH);
+    const db = await open({ filename: stateFilename, driver: sqlite3.Database, mode: sqlite3.OPEN_READONLY });
     try {
         assert.ok(await db.get(`SELECT id FROM ${STATE_TABLE} WHERE id = 1`));
-        assert.equal((await db.get('SELECT COUNT(*) AS count FROM garmin_session')).count, 1);
+        assert.equal(await db.get("SELECT name FROM sqlite_master WHERE name = 'garmin_session'"), undefined);
     } finally { await db.close(); }
 });
 
@@ -143,6 +159,65 @@ test('workspace recovers a compact upload intent before the full database checkp
     finally { await reader.close(); }
 });
 
+test('workspace migrates legacy mappings and upload intent without changing tracked files', async t => {
+    const { root } = await fixture(t);
+    process.env.AESKEY = 'test-key';
+    await createGarminDb(root, 'garmin@example.invalid', process.env.AESKEY);
+    const state = emptyState();
+    state.accounts['garmin-cn'] = hash('garmin-cn');
+    state.accounts['coros-cn'] = hash('coros-cn');
+    const source = activity('garmin-cn', 'legacy');
+    const canonical = 'legacy_canonical';
+    state.activities['garmin-cn:legacy'] = { activity: source, canonical, missing: 0, evidence: evidence(source) };
+    const task = state.transfers[`${canonical}:coros-cn`] = {
+        canonical, source: 'garmin-cn', sourceId: source.id, target: 'coros-cn', status: 'uploading',
+        attempt: '00000000-0000-4000-8000-000000000009',
+        filename: 'dailysync_00000000-0000-4000-8000-000000000009.fit', createdAt: 1,
+        evidence: evidence(source), beforeIds: [],
+    };
+    const legacyDb = path.join(root, 'db', 'garmin.db');
+    const writer = await GarminDbState.open(legacyDb, true, process.env.AESKEY);
+    try { await writer.save(state); } finally { await writer.close(); }
+    await writeUploadIntent(root, createUploadIntent(state, task));
+    await fs.copyFile(path.join(root, UPLOAD_INTENT_PATH), path.join(root, LEGACY_UPLOAD_INTENT_PATH));
+    await fs.rm(path.join(root, 'coros-sync', '.local'), { recursive: true, force: true });
+    const beforeDb = await fs.readFile(legacyDb);
+    const beforeIntent = await fs.readFile(path.join(root, LEGACY_UPLOAD_INTENT_PATH));
+
+    const workspace = await SyncWorkspace.create(root);
+    try { assert.equal(Object.values((await workspace.load(true)).transfers)[0].sourceId, 'legacy'); }
+    finally { await workspace.close(); }
+
+    assert.deepEqual(await fs.readFile(legacyDb), beforeDb);
+    assert.deepEqual(await fs.readFile(path.join(root, LEGACY_UPLOAD_INTENT_PATH)), beforeIntent);
+    await fs.stat(path.join(root, COROS_STATE_DB_PATH));
+    await fs.stat(path.join(root, UPLOAD_INTENT_PATH));
+});
+
+test('workspace never ignores a legacy upload intent whose database state is missing', async t => {
+    const { root } = await fixture(t);
+    process.env.AESKEY = 'test-key';
+    await createGarminDb(root, 'garmin@example.invalid', process.env.AESKEY);
+    const state = emptyState();
+    state.accounts['garmin-cn'] = hash('garmin-cn');
+    state.accounts['coros-cn'] = hash('coros-cn');
+    const source = activity('garmin-cn', 'orphaned');
+    const canonical = 'orphaned_canonical';
+    state.activities['garmin-cn:orphaned'] = { activity: source, canonical, missing: 0, evidence: evidence(source) };
+    const task = state.transfers[`${canonical}:coros-cn`] = {
+        canonical, source: 'garmin-cn', sourceId: source.id, target: 'coros-cn', status: 'uploading',
+        attempt: '00000000-0000-4000-8000-000000000008',
+        filename: 'dailysync_00000000-0000-4000-8000-000000000008.fit', createdAt: 1,
+        evidence: evidence(source), beforeIds: [],
+    };
+    await fs.mkdir(path.join(root, 'coros-sync'), { recursive: true });
+    await fs.writeFile(path.join(root, LEGACY_UPLOAD_INTENT_PATH),
+        CryptoJS.AES.encrypt(JSON.stringify(createUploadIntent(state, task)), process.env.AESKEY).toString());
+
+    await assert.rejects(SyncWorkspace.create(root), { code: 'STATE_INVALID' });
+    await assert.rejects(fs.stat(path.join(root, COROS_STATE_DB_PATH)), { code: 'ENOENT' });
+});
+
 test('writable workspaces hold an exclusive lock and remove all per-run artifacts after closing', async t => {
     const { root } = await fixture(t);
     process.env.AESKEY = 'test-key';
@@ -157,11 +232,11 @@ test('writable workspaces hold an exclusive lock and remove all per-run artifact
         await first.close();
         await second.close();
     }
-    assert.deepEqual(await fs.readdir(path.join(root, 'coros-sync', '.local')), []);
+    assert.deepEqual(await fs.readdir(path.join(root, 'coros-sync', '.local')), ['coros-state.db']);
 
     const next = await SyncWorkspace.create(root);
     try { await next.load(true); } finally { await next.close(); }
-    assert.deepEqual(await fs.readdir(path.join(root, 'coros-sync', '.local')), []);
+    assert.deepEqual(await fs.readdir(path.join(root, 'coros-sync', '.local')), ['coros-state.db']);
 });
 
 test('a replaced write lock stops state saves and is never removed as if still owned', async t => {

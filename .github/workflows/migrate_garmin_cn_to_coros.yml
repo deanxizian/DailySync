@@ -47,12 +47,6 @@ jobs:
             --time-budget 2700 \
             --migrate-start "$migrate_start" \
             --apply
-      - name: Save COROS migration state
-        if: ${{ always() && steps.garmin_db_lock.outputs.acquired == 'true' }}
-        uses: stefanzweifel/git-auto-commit-action@v5
-        with:
-          commit_message: Save COROS Migration State
-          file_pattern: db/garmin.db coros-sync
       - name: Release Garmin database writer lock
         if: ${{ always() && steps.garmin_db_lock.outputs.acquired == 'true' }}
         env:
