@@ -1,7 +1,7 @@
 import { spawnSync } from 'child_process';
 import { SyncError } from './errors';
 import { UploadIntent } from './types';
-import { UPLOAD_INTENT_PATH, writeUploadIntent } from './upload-intent';
+import { clearUploadIntent, UPLOAD_INTENT_PATH, writeUploadIntent } from './upload-intent';
 
 const DEFAULT_LOCK_REF = 'refs/heads/codex/garmin-db-writer-lock';
 const HASH = /^[a-f0-9]{40}(?:[a-f0-9]{24})?$/;
@@ -112,5 +112,58 @@ export async function publishCorosUploadIntent(root: string, intent: UploadInten
     }
     if (remoteHash(root, context.lockRef, context, 'LOCK_LOST') !== context.lockCommit) {
         throw new SyncError('LOCK_LOST', 'The Action lost the remote Garmin database writer lock after publishing.');
+    }
+}
+
+export async function clearCorosUploadIntent(root: string,
+    environment: NodeJS.ProcessEnv = process.env): Promise<void> {
+    const context = actionContext(root, environment);
+    if (!context) {
+        await clearUploadIntent(root);
+        return;
+    }
+    if (remoteHash(root, context.lockRef, context, 'LOCK_LOST') !== context.lockCommit) {
+        throw new SyncError('LOCK_LOST', 'The Action no longer owns the remote Garmin database writer lock.');
+    }
+
+    const head = gitOutput(root, ['rev-parse', '--verify', 'HEAD'], context);
+    if (!HASH.test(head) || remoteHash(root, context.branchRef, context, 'STATE_PUBLISH') !== head) {
+        throw new SyncError('STATE_PUBLISH', 'The workflow branch changed before the COROS upload intent was cleared.');
+    }
+    if (stagedPaths(root, context).length) {
+        throw new SyncError('STATE_PUBLISH', 'Unrelated staged changes prevent clearing the COROS upload intent.');
+    }
+
+    await clearUploadIntent(root);
+    const tracked = git(root, ['ls-files', '--error-unmatch', '--', UPLOAD_INTENT_PATH], context.env);
+    if (tracked.status === 1) return;
+    if (tracked.status !== 0) {
+        throw new SyncError('STATE_PUBLISH', 'Git could not inspect the COROS upload intent before clearing it.');
+    }
+    if (git(root, ['add', '--', UPLOAD_INTENT_PATH], context.env).status !== 0) {
+        throw new SyncError('STATE_PUBLISH', 'The COROS upload intent deletion could not be staged.');
+    }
+    const staged = stagedPaths(root, context);
+    if (!staged.length) return;
+    if (staged.length !== 1 || staged[0] !== UPLOAD_INTENT_PATH) {
+        throw new SyncError('STATE_PUBLISH', 'The COROS upload intent deletion did not produce an isolated state change.');
+    }
+    const commit = git(root, ['-c', 'user.name=github-actions[bot]',
+        '-c', 'user.email=41898282+github-actions[bot]@users.noreply.github.com',
+        '-c', 'commit.gpgsign=false', 'commit', '--no-verify', '-m', 'Clear COROS Upload Intent'], context.env);
+    if (commit.status !== 0) throw new SyncError('STATE_PUBLISH', 'Git could not commit the COROS upload intent deletion.');
+    const clearedCommit = gitOutput(root, ['rev-parse', '--verify', 'HEAD'], context);
+    if (!HASH.test(clearedCommit)) throw new SyncError('STATE_PUBLISH', 'The COROS upload intent deletion commit is invalid.');
+
+    if (remoteHash(root, context.lockRef, context, 'LOCK_LOST') !== context.lockCommit) {
+        throw new SyncError('LOCK_LOST', 'The Action lost the remote Garmin database writer lock before clearing the intent.');
+    }
+    git(root, ['push', '--porcelain', 'origin', `HEAD:${context.branchRef}`], context.env);
+    const published = remoteHash(root, context.branchRef, context, 'STATE_PUBLISH');
+    if (published !== clearedCommit) {
+        throw new SyncError('STATE_PUBLISH', 'The COROS upload intent deletion was not published to the workflow branch.');
+    }
+    if (remoteHash(root, context.lockRef, context, 'LOCK_LOST') !== context.lockCommit) {
+        throw new SyncError('LOCK_LOST', 'The Action lost the remote Garmin database writer lock after clearing the intent.');
     }
 }

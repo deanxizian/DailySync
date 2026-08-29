@@ -7,7 +7,7 @@ import { newerGarminSession, readGarminCnSession } from './sync/garmin-db';
 import { CliOptions, loadPrivateEnv, parseActivityReference, parseOptions, requireBridgeAccounts } from './sync/config';
 import { safeError, SyncError } from './sync/errors';
 import { SyncWorkspace } from './sync/workspace';
-import { assertRemoteGarminDbLock, publishCorosUploadIntent } from './sync/git-checkpoint';
+import { assertRemoteGarminDbLock, clearCorosUploadIntent, publishCorosUploadIntent } from './sync/git-checkpoint';
 import { activityKey, PlatformAdapter, Slot, SyncState, transferKey } from './sync/types';
 
 export type BridgeProfile = 'migration' | 'sync';
@@ -113,7 +113,7 @@ export async function main(profile: BridgeProfile, args = process.argv.slice(2),
         };
         const engine = new ActivitySynchronizer({ adapters, state, directory: workspace.directory,
             checkpoint: value => workspace.save(value), publishIntent: intent => publishCorosUploadIntent(root, intent),
-            clearIntent: () => workspace.clearUploadIntent(), assertOwned,
+            clearIntent: async () => { await workspace.assertOwned(); await clearCorosUploadIntent(root); }, assertOwned,
             emit: options.json ? undefined : event => {
                 if (event.status !== 'existing') console.log(`${event.source} ${event.status}${event.code ? ` (${event.code})` : ''}${event.candidates?.length ? ` candidates=${event.candidates.join(',')}` : ''}`);
             } }, { apply: write, activityId: options.activityId,

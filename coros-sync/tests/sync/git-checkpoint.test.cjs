@@ -5,7 +5,7 @@ const fs = require('node:fs/promises');
 const os = require('node:os');
 const path = require('node:path');
 const { execFileSync } = require('node:child_process');
-const { assertRemoteGarminDbLock, publishCorosUploadIntent } = require('../../src/sync/git-checkpoint');
+const { assertRemoteGarminDbLock, clearCorosUploadIntent, publishCorosUploadIntent } = require('../../src/sync/git-checkpoint');
 const { createUploadIntent, readUploadIntent, UPLOAD_INTENT_PATH } = require('../../src/sync/upload-intent');
 const { DEFAULT_AES_KEY } = require('../../src/sync/garmin-db');
 const { emptyState } = require('../../src/sync/types');
@@ -91,6 +91,20 @@ test('Action upload intents are compact commits that leave the full Garmin datab
     assert.equal(remoteHash(f.work, LOCK_REF), f.lockCommit);
     assert.equal(git(f.work, ['status', '--porcelain']), 'M db/garmin.db');
     await assertRemoteGarminDbLock(f.work, f.env);
+
+    await clearCorosUploadIntent(f.work, f.env);
+
+    const cleared = remoteHash(f.work, 'refs/heads/feature');
+    assert.notEqual(cleared, after);
+    assert.equal(cleared, git(f.work, ['rev-parse', 'HEAD']));
+    assert.equal(git(f.work, ['--git-dir', f.remote, 'ls-tree', '--name-only', cleared, UPLOAD_INTENT_PATH]), '');
+    assert.equal(git(f.work, ['--git-dir', f.remote, 'show', `${cleared}:db/garmin.db`]), 'initial');
+    assert.equal(git(f.work, ['show', '-s', '--format=%s', cleared]), 'Clear COROS Upload Intent');
+    assert.equal(remoteHash(f.work, LOCK_REF), f.lockCommit);
+    assert.equal(git(f.work, ['status', '--porcelain']), 'M db/garmin.db');
+
+    await clearCorosUploadIntent(f.work, f.env);
+    assert.equal(remoteHash(f.work, 'refs/heads/feature'), cleared);
 });
 
 test('an empty Action AESKEY uses the original default for its upload intent', async t => {
@@ -125,7 +139,22 @@ test('a concurrently advanced workflow branch rejects an intent before commit or
     assert.equal(remoteHash(f.work, 'refs/heads/feature'), advanced);
 });
 
+test('a concurrently advanced workflow branch rejects an intent deletion', async t => {
+    const f = await fixture(t);
+    await publishCorosUploadIntent(f.work, uploadIntent(), f.env);
+    const localHead = git(f.work, ['rev-parse', 'HEAD']);
+    const tree = git(f.work, ['rev-parse', `${localHead}^{tree}`]);
+    const advanced = git(f.work, ['commit-tree', tree, '-p', localHead, '-m', 'Concurrent update'], { env: identity() });
+    git(f.work, ['push', 'origin', `${advanced}:refs/heads/feature`]);
+
+    await assert.rejects(clearCorosUploadIntent(f.work, f.env), { code: 'STATE_PUBLISH' });
+    assert.equal(git(f.work, ['rev-parse', 'HEAD']), localHead);
+    assert.equal(remoteHash(f.work, 'refs/heads/feature'), advanced);
+    assert.ok(git(f.work, ['--git-dir', f.remote, 'show', `${advanced}:${UPLOAD_INTENT_PATH}`]));
+});
+
 test('local runs do not require a Git repository or remote lock', async () => {
     await publishCorosUploadIntent('/path/that/does/not/exist', uploadIntent(), {});
+    await clearCorosUploadIntent('/path/that/does/not/exist', {});
     await assertRemoteGarminDbLock('/path/that/does/not/exist', {});
 });
