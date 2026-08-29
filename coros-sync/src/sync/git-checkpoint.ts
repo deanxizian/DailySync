@@ -1,4 +1,8 @@
 import { spawnSync } from 'child_process';
+import { randomUUID } from 'crypto';
+import fs from 'fs/promises';
+import os from 'os';
+import path from 'path';
 import { SyncError } from './errors';
 import { UploadIntent } from './types';
 import { clearUploadIntent, UPLOAD_INTENT_PATH, writeUploadIntent } from './upload-intent';
@@ -76,6 +80,48 @@ function stageStateAndIntent(root: string, context: ActionGitContext, action: st
     }
 }
 
+async function createCheckpointCommit(root: string, context: ActionGitContext, parent: string,
+    message: string, action: string): Promise<string> {
+    const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'dailysync-git-index-'));
+    const stagedContext = { ...context,
+        env: { ...context.env, GIT_INDEX_FILE: path.join(directory, `index-${randomUUID()}`) } };
+    try {
+        gitOutput(root, ['read-tree', parent], stagedContext);
+        stageStateAndIntent(root, stagedContext, action);
+        const tree = gitOutput(root, ['write-tree'], stagedContext);
+        if (!HASH.test(tree)) throw new SyncError('STATE_PUBLISH', 'The COROS state checkpoint tree is invalid.');
+        const commitContext = { ...stagedContext, env: { ...stagedContext.env,
+            GIT_AUTHOR_NAME: 'github-actions[bot]',
+            GIT_AUTHOR_EMAIL: '41898282+github-actions[bot]@users.noreply.github.com',
+            GIT_COMMITTER_NAME: 'github-actions[bot]',
+            GIT_COMMITTER_EMAIL: '41898282+github-actions[bot]@users.noreply.github.com' } };
+        const commit = gitOutput(root, ['commit-tree', tree, '-p', parent, '-m', message], commitContext);
+        if (!HASH.test(commit)) throw new SyncError('STATE_PUBLISH', 'The COROS state checkpoint commit is invalid.');
+        return commit;
+    } finally {
+        await fs.rm(directory, { recursive: true, force: true }).catch(() => {});
+    }
+}
+
+function publishCheckpointCommit(root: string, context: ActionGitContext, parent: string,
+    commit: string, action: string): void {
+    if (remoteHash(root, context.lockRef, context, 'LOCK_LOST') !== context.lockCommit) {
+        throw new SyncError('LOCK_LOST', `The Action lost the remote Garmin database writer lock before ${action}.`);
+    }
+    // A transport can report failure after the remote accepted the commit, so the remote hash is authoritative.
+    git(root, ['push', '--porcelain', 'origin', `${commit}:${context.branchRef}`], context.env);
+    if (remoteHash(root, context.branchRef, context, 'STATE_PUBLISH') !== commit) {
+        throw new SyncError('STATE_PUBLISH', `The COROS state checkpoint was not published while ${action}.`);
+    }
+    if (git(root, ['update-ref', 'HEAD', commit, parent], context.env).status !== 0 ||
+        git(root, ['read-tree', commit], context.env).status !== 0) {
+        throw new SyncError('STATE_PUBLISH', 'The local workflow branch could not follow the published COROS state checkpoint.');
+    }
+    if (remoteHash(root, context.lockRef, context, 'LOCK_LOST') !== context.lockCommit) {
+        throw new SyncError('LOCK_LOST', `The Action lost the remote Garmin database writer lock after ${action}.`);
+    }
+}
+
 export async function assertRemoteGarminDbLock(root: string,
     environment: NodeJS.ProcessEnv = process.env): Promise<void> {
     const context = actionContext(root, environment);
@@ -102,26 +148,9 @@ export async function publishCorosUploadIntent(root: string, intent: UploadInten
     }
 
     await writeUploadIntent(root, intent, environment.AESKEY);
-    stageStateAndIntent(root, context, 'publication');
-    const commit = git(root, ['-c', 'user.name=github-actions[bot]',
-        '-c', 'user.email=41898282+github-actions[bot]@users.noreply.github.com',
-        '-c', 'commit.gpgsign=false', 'commit', '--no-verify', '-m', 'Save COROS Upload Intent'], context.env);
-    if (commit.status !== 0) throw new SyncError('STATE_PUBLISH', 'Git could not commit the COROS upload intent.');
-    const intentCommit = gitOutput(root, ['rev-parse', '--verify', 'HEAD'], context);
-    if (!HASH.test(intentCommit)) throw new SyncError('STATE_PUBLISH', 'The COROS upload intent commit is invalid.');
-
-    if (remoteHash(root, context.lockRef, context, 'LOCK_LOST') !== context.lockCommit) {
-        throw new SyncError('LOCK_LOST', 'The Action lost the remote Garmin database writer lock before publishing.');
-    }
-    // A transport can report failure after the remote accepted the commit, so the remote hash is authoritative.
-    git(root, ['push', '--porcelain', 'origin', `HEAD:${context.branchRef}`], context.env);
-    const published = remoteHash(root, context.branchRef, context, 'STATE_PUBLISH');
-    if (published !== intentCommit) {
-        throw new SyncError('STATE_PUBLISH', 'The COROS upload intent was not published to the workflow branch.');
-    }
-    if (remoteHash(root, context.lockRef, context, 'LOCK_LOST') !== context.lockCommit) {
-        throw new SyncError('LOCK_LOST', 'The Action lost the remote Garmin database writer lock after publishing.');
-    }
+    const intentCommit = await createCheckpointCommit(root, context, head,
+        'Save COROS Upload Intent', 'publication');
+    publishCheckpointCommit(root, context, head, intentCommit, 'publishing the upload intent');
 }
 
 export async function clearCorosUploadIntent(root: string,
@@ -149,23 +178,7 @@ export async function clearCorosUploadIntent(root: string,
     if (tracked.status !== 0) {
         throw new SyncError('STATE_PUBLISH', 'Git could not inspect the COROS upload intent before clearing it.');
     }
-    stageStateAndIntent(root, context, 'deletion');
-    const commit = git(root, ['-c', 'user.name=github-actions[bot]',
-        '-c', 'user.email=41898282+github-actions[bot]@users.noreply.github.com',
-        '-c', 'commit.gpgsign=false', 'commit', '--no-verify', '-m', 'Clear COROS Upload Intent'], context.env);
-    if (commit.status !== 0) throw new SyncError('STATE_PUBLISH', 'Git could not commit the COROS upload intent deletion.');
-    const clearedCommit = gitOutput(root, ['rev-parse', '--verify', 'HEAD'], context);
-    if (!HASH.test(clearedCommit)) throw new SyncError('STATE_PUBLISH', 'The COROS upload intent deletion commit is invalid.');
-
-    if (remoteHash(root, context.lockRef, context, 'LOCK_LOST') !== context.lockCommit) {
-        throw new SyncError('LOCK_LOST', 'The Action lost the remote Garmin database writer lock before clearing the intent.');
-    }
-    git(root, ['push', '--porcelain', 'origin', `HEAD:${context.branchRef}`], context.env);
-    const published = remoteHash(root, context.branchRef, context, 'STATE_PUBLISH');
-    if (published !== clearedCommit) {
-        throw new SyncError('STATE_PUBLISH', 'The COROS upload intent deletion was not published to the workflow branch.');
-    }
-    if (remoteHash(root, context.lockRef, context, 'LOCK_LOST') !== context.lockCommit) {
-        throw new SyncError('LOCK_LOST', 'The Action lost the remote Garmin database writer lock after clearing the intent.');
-    }
+    const clearedCommit = await createCheckpointCommit(root, context, head,
+        'Clear COROS Upload Intent', 'deletion');
+    publishCheckpointCommit(root, context, head, clearedCommit, 'clearing the upload intent');
 }

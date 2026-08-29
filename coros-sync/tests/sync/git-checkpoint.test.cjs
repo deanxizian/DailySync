@@ -144,6 +144,35 @@ test('a missing remote lock rejects an intent before changing branch history', a
     assert.equal(git(f.work, ['rev-parse', 'HEAD']), branch);
 });
 
+test('a rejected intent push never advances local history or leaks into the later state commit', async t => {
+    const f = await fixture(t);
+    const before = remoteHash(f.work, 'refs/heads/feature');
+    await fs.writeFile(path.join(f.work, 'db', 'garmin.db'), 'uploading state');
+    const hook = path.join(f.remote, 'hooks', 'pre-receive');
+    await fs.writeFile(hook, '#!/bin/sh\nexit 1\n');
+    await fs.chmod(hook, 0o755);
+
+    await assert.rejects(publishCorosUploadIntent(f.work, uploadIntent(), f.env), { code: 'STATE_PUBLISH' });
+    await fs.unlink(hook);
+
+    assert.equal(git(f.work, ['rev-parse', 'HEAD']), before);
+    assert.equal(remoteHash(f.work, 'refs/heads/feature'), before);
+    assert.equal(git(f.work, ['diff', '--cached', '--name-only']), '');
+    assert.equal(git(f.work, ['ls-files', UPLOAD_INTENT_PATH]), '');
+    await fs.access(path.join(f.work, UPLOAD_INTENT_PATH));
+
+    await fs.writeFile(path.join(f.work, 'db', 'garmin.db'), 'pending rollback state');
+    await clearCorosUploadIntent(f.work, f.env);
+    await assert.rejects(fs.access(path.join(f.work, UPLOAD_INTENT_PATH)));
+    git(f.work, ['add', 'db/garmin.db']);
+    git(f.work, ['commit', '-m', 'Save rollback state']);
+    git(f.work, ['push', 'origin', 'HEAD:refs/heads/feature']);
+
+    const after = remoteHash(f.work, 'refs/heads/feature');
+    assert.equal(git(f.work, ['--git-dir', f.remote, 'ls-tree', '--name-only', after, UPLOAD_INTENT_PATH]), '');
+    assert.equal(git(f.work, ['--git-dir', f.remote, 'show', `${after}:db/garmin.db`]), 'pending rollback state');
+});
+
 test('a concurrently advanced workflow branch rejects an intent before commit or upload', async t => {
     const f = await fixture(t);
     const localHead = git(f.work, ['rev-parse', 'HEAD']);
