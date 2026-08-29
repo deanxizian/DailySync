@@ -178,7 +178,14 @@ export class CorosAdapter implements PlatformAdapter {
         if (total === null || !Number.isSafeInteger(total)) {
             throw new SyncError('PROTOCOL', 'COROS activity page is missing a stable total count; scan is incomplete.');
         }
-        if (total === 0 && data?.dataList === undefined) return { activities: [], next: null, total };
+        if (data?.dataList === undefined) {
+            const pageNumber = finiteNumber(data?.pageNumber);
+            const totalPages = finiteNumber(data?.totalPage);
+            const pastLastPage = pageNumber !== null && totalPages !== null &&
+                Number.isSafeInteger(pageNumber) && Number.isSafeInteger(totalPages) &&
+                pageNumber === cursor + 1 && pageNumber > totalPages;
+            if (total === 0 || pastLastPage) return { activities: [], next: null, total };
+        }
         if (!Array.isArray(data?.dataList)) throw new SyncError('PROTOCOL', 'COROS activity page is missing dataList; scan is incomplete.');
         const activities = data.dataList.map(normalizeCoros);
         return { activities, next: activities.length ? cursor + 1 : null, total };

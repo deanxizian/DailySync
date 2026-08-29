@@ -7,6 +7,7 @@ const path = require('node:path');
 const { createHash, randomUUID } = require('node:crypto');
 const JSZip = require('jszip');
 const { CorosAdapter, normalizeCoros, validDownloadUrl } = require('../../src/sync/coros');
+const { scanAll } = require('../../src/sync/engine');
 const { SyncError, safeError } = require('../../src/sync/errors');
 const { activity, hash, start } = require('./helpers.cjs');
 
@@ -74,8 +75,8 @@ test('COROS login uses protocol MD5, China cookies and memory-only tokens', asyn
 test('COROS pagination preserves int64 IDs, UTC time and an explicit empty end page', async () => {
     const f = fixture(config => config.url.endsWith('/activity/query')
         ? config.params.pageNumber === 1
-            ? { status: 200, data: `{"result":"0000","data":{"count":1,"dataList":[{"labelId":9223372036854775800,"startTime":${start / 1000},"sportType":100,"totalTime":1800,"distance":5000}]}}` }
-            : success({ count: 1, dataList: [] })
+            ? { status: 200, data: `{"result":"0000","data":{"count":1,"pageNumber":1,"totalPage":1,"dataList":[{"labelId":9223372036854775800,"startTime":${start / 1000},"sportType":100,"totalTime":1800,"distance":5000}]}}` }
+            : success({ count: 1, pageNumber: 2, totalPage: 1 })
         : undefined);
     await f.adapter.connect();
     const first = await f.adapter.page(0), last = await f.adapter.page(1);
@@ -86,6 +87,18 @@ test('COROS pagination preserves int64 IDs, UTC time and an explicit empty end p
     assert.throws(() => normalizeCoros({ ...row, labelId: Number(row.labelId) }), { code: 'PROTOCOL' });
     assert.throws(() => normalizeCoros({ ...row, startTime: 'local-time' }), { code: 'PROTOCOL' });
     assert.throws(() => normalizeCoros({ ...row, sportType: true }), { code: 'PROTOCOL' });
+});
+
+test('COROS full scans accept an omitted list only after the echoed last page', async () => {
+    const f = fixture(config => config.url.endsWith('/activity/query')
+        ? config.params.pageNumber === 1
+            ? success({ count: 1, pageNumber: 1, totalPage: 1, dataList: [row] })
+            : success({ count: 1, pageNumber: 2, totalPage: 1 })
+        : undefined);
+    await f.adapter.connect();
+    const activities = await scanAll(f.adapter);
+    assert.equal(activities.length, 1);
+    assert.deepEqual(f.calls.filter(call => call.url.endsWith('/activity/query')).map(call => call.params.pageNumber), [1, 2]);
 });
 
 test('COROS verification windows become bounded China calendar-day queries', async () => {
@@ -105,6 +118,8 @@ test('COROS accepts the empty-account response that omits dataList', async () =>
 
 test('COROS malformed or rejected pages are never interpreted as an empty history', async () => {
     for (const data of [{ result: '0000', data: null }, { result: '0000', data: { count: 1 } },
+        { result: '0000', data: { count: 1, pageNumber: 1, totalPage: 1 } },
+        { result: '0000', data: { count: 1, pageNumber: 3, totalPage: 1 } },
         { result: '0000', data: { count: 0, dataList: {} } },
         { result: '0000', data: { dataList: [] } }, { result: 'changed' }]) {
         const f = fixture(config => config.url.endsWith('/activity/query') ? { status: 200, data } : undefined);
