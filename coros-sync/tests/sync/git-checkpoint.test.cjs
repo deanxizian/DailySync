@@ -173,6 +173,34 @@ test('a rejected intent push never advances local history or leaks into the late
     assert.equal(git(f.work, ['--git-dir', f.remote, 'show', `${after}:db/garmin.db`]), 'pending rollback state');
 });
 
+test('an accepted intent is rolled back when the local branch cannot follow its remote commit', async t => {
+    const f = await fixture(t);
+    const before = remoteHash(f.work, 'refs/heads/feature');
+    const gitDirectory = path.resolve(f.work, git(f.work, ['rev-parse', '--git-dir']));
+    const branchLock = path.join(gitDirectory, 'refs', 'heads', 'feature.lock');
+    await fs.writeFile(path.join(f.work, 'db', 'garmin.db'), 'uploading state');
+    await fs.writeFile(branchLock, 'prevent local ref update');
+
+    await assert.rejects(publishCorosUploadIntent(f.work, uploadIntent(), f.env), { code: 'STATE_PUBLISH' });
+
+    const intentCommit = remoteHash(f.work, 'refs/heads/feature');
+    assert.notEqual(intentCommit, before);
+    assert.equal(git(f.work, ['rev-parse', 'HEAD']), before);
+    assert.equal(git(f.work, ['show', '-s', '--format=%s', intentCommit]), 'Save COROS Upload Intent');
+    assert.ok(git(f.work, ['--git-dir', f.remote, 'show', `${intentCommit}:${UPLOAD_INTENT_PATH}`]));
+
+    await fs.unlink(branchLock);
+    await fs.writeFile(path.join(f.work, 'db', 'garmin.db'), 'pending rollback state');
+    await clearCorosUploadIntent(f.work, f.env);
+
+    const cleared = remoteHash(f.work, 'refs/heads/feature');
+    assert.equal(git(f.work, ['rev-parse', 'HEAD']), cleared);
+    assert.equal(git(f.work, ['rev-parse', `${cleared}^^`]), before);
+    assert.equal(git(f.work, ['--git-dir', f.remote, 'ls-tree', '--name-only', cleared, UPLOAD_INTENT_PATH]), '');
+    assert.equal(git(f.work, ['--git-dir', f.remote, 'show', `${cleared}:db/garmin.db`]), 'pending rollback state');
+    assert.equal(git(f.work, ['status', '--porcelain']), '');
+});
+
 test('a concurrently advanced workflow branch rejects an intent before commit or upload', async t => {
     const f = await fixture(t);
     const localHead = git(f.work, ['rev-parse', 'HEAD']);

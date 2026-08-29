@@ -60,21 +60,24 @@ function remoteHash(root: string, ref: string, context: ActionGitContext, code: 
     return fields[0];
 }
 
-function stagedPaths(root: string, context: ActionGitContext): string[] {
-    const result = git(root, ['diff', '--cached', '--name-only', '-z'], context.env);
+function stagedPaths(root: string, context: ActionGitContext, base?: string): string[] {
+    const args = ['diff', '--cached', '--name-only', '-z'];
+    if (base) args.push(base, '--');
+    const result = git(root, args, context.env);
     if (result.status !== 0) throw new SyncError('STATE_PUBLISH', 'Cannot inspect the staged COROS upload intent.');
     return output(result).split('\0').filter(Boolean);
 }
 
-function stageStateAndIntent(root: string, context: ActionGitContext, action: string): void {
+function stageStateAndIntent(root: string, context: ActionGitContext, parent: string, action: string): void {
     if (git(root, ['add', '--', GARMIN_DB_PATH, UPLOAD_INTENT_PATH], context.env).status !== 0) {
         throw new SyncError('STATE_PUBLISH', `The COROS upload intent ${action} could not be staged.`);
     }
-    const staged = stagedPaths(root, context);
+    const staged = stagedPaths(root, context, parent);
     if (staged.length !== 2 || !staged.includes(GARMIN_DB_PATH) || !staged.includes(UPLOAD_INTENT_PATH)) {
         throw new SyncError('STATE_PUBLISH', `The COROS upload intent ${action} did not include an isolated database checkpoint.`);
     }
-    const deleted = git(root, ['diff', '--cached', '--diff-filter=D', '--name-only', '--', GARMIN_DB_PATH], context.env);
+    const deleted = git(root,
+        ['diff', '--cached', '--diff-filter=D', '--name-only', parent, '--', GARMIN_DB_PATH], context.env);
     if (deleted.status !== 0 || output(deleted).trim()) {
         throw new SyncError('STATE_PUBLISH', 'The COROS state checkpoint cannot delete db/garmin.db.');
     }
@@ -87,7 +90,7 @@ async function createCheckpointCommit(root: string, context: ActionGitContext, p
         env: { ...context.env, GIT_INDEX_FILE: path.join(directory, `index-${randomUUID()}`) } };
     try {
         gitOutput(root, ['read-tree', parent], stagedContext);
-        stageStateAndIntent(root, stagedContext, action);
+        stageStateAndIntent(root, stagedContext, parent, action);
         const tree = gitOutput(root, ['write-tree'], stagedContext);
         if (!HASH.test(tree)) throw new SyncError('STATE_PUBLISH', 'The COROS state checkpoint tree is invalid.');
         const commitContext = { ...stagedContext, env: { ...stagedContext.env,
@@ -103,8 +106,20 @@ async function createCheckpointCommit(root: string, context: ActionGitContext, p
     }
 }
 
+function followPublishedCommit(root: string, context: ActionGitContext, commit: string,
+    expectedHeads: string[]): boolean {
+    for (let attempt = 0; attempt < 3; attempt++) {
+        const current = git(root, ['rev-parse', '--verify', 'HEAD'], context.env);
+        const head = current.status === 0 ? output(current).trim() : '';
+        if (!HASH.test(head) || (head !== commit && !expectedHeads.includes(head))) return false;
+        if (head !== commit && git(root, ['update-ref', 'HEAD', commit, head], context.env).status !== 0) continue;
+        if (git(root, ['read-tree', commit], context.env).status === 0) return true;
+    }
+    return false;
+}
+
 function publishCheckpointCommit(root: string, context: ActionGitContext, parent: string,
-    commit: string, action: string): void {
+    commit: string, action: string, expectedHeads: string[] = [parent]): void {
     if (remoteHash(root, context.lockRef, context, 'LOCK_LOST') !== context.lockCommit) {
         throw new SyncError('LOCK_LOST', `The Action lost the remote Garmin database writer lock before ${action}.`);
     }
@@ -113,13 +128,23 @@ function publishCheckpointCommit(root: string, context: ActionGitContext, parent
     if (remoteHash(root, context.branchRef, context, 'STATE_PUBLISH') !== commit) {
         throw new SyncError('STATE_PUBLISH', `The COROS state checkpoint was not published while ${action}.`);
     }
-    if (git(root, ['update-ref', 'HEAD', commit, parent], context.env).status !== 0 ||
-        git(root, ['read-tree', commit], context.env).status !== 0) {
+    if (!followPublishedCommit(root, context, commit, expectedHeads)) {
         throw new SyncError('STATE_PUBLISH', 'The local workflow branch could not follow the published COROS state checkpoint.');
     }
     if (remoteHash(root, context.lockRef, context, 'LOCK_LOST') !== context.lockCommit) {
         throw new SyncError('LOCK_LOST', `The Action lost the remote Garmin database writer lock after ${action}.`);
     }
+}
+
+function recoverableRemoteIntent(root: string, context: ActionGitContext,
+    localHead: string, remoteHead: string): boolean {
+    const parent = git(root, ['rev-parse', '--verify', `${remoteHead}^`], context.env);
+    const subject = git(root, ['show', '-s', '--format=%s', remoteHead], context.env);
+    const changed = git(root, ['diff-tree', '--no-commit-id', '--name-only', '-r', remoteHead], context.env);
+    if (parent.status !== 0 || output(parent).trim() !== localHead || subject.status !== 0 ||
+        output(subject).trim() !== 'Save COROS Upload Intent' || changed.status !== 0) return false;
+    const paths = output(changed).trim().split('\n').filter(Boolean).sort();
+    return paths.length === 2 && paths[0] === UPLOAD_INTENT_PATH && paths[1] === GARMIN_DB_PATH;
 }
 
 export async function assertRemoteGarminDbLock(root: string,
@@ -165,20 +190,22 @@ export async function clearCorosUploadIntent(root: string,
     }
 
     const head = gitOutput(root, ['rev-parse', '--verify', 'HEAD'], context);
-    if (!HASH.test(head) || remoteHash(root, context.branchRef, context, 'STATE_PUBLISH') !== head) {
+    const remote = remoteHash(root, context.branchRef, context, 'STATE_PUBLISH');
+    if (!HASH.test(head) || !remote || (remote !== head && !recoverableRemoteIntent(root, context, head, remote))) {
         throw new SyncError('STATE_PUBLISH', 'The workflow branch changed before the COROS upload intent was cleared.');
     }
+    const parent = remote;
     if (stagedPaths(root, context).length) {
         throw new SyncError('STATE_PUBLISH', 'Unrelated staged changes prevent clearing the COROS upload intent.');
     }
 
     await clearUploadIntent(root);
-    const tracked = git(root, ['ls-files', '--error-unmatch', '--', UPLOAD_INTENT_PATH], context.env);
-    if (tracked.status === 1) return;
+    const tracked = git(root, ['ls-tree', '--name-only', parent, '--', UPLOAD_INTENT_PATH], context.env);
     if (tracked.status !== 0) {
         throw new SyncError('STATE_PUBLISH', 'Git could not inspect the COROS upload intent before clearing it.');
     }
-    const clearedCommit = await createCheckpointCommit(root, context, head,
+    if (!output(tracked).trim()) return;
+    const clearedCommit = await createCheckpointCommit(root, context, parent,
         'Clear COROS Upload Intent', 'deletion');
-    publishCheckpointCommit(root, context, head, clearedCommit, 'clearing the upload intent');
+    publishCheckpointCommit(root, context, parent, clearedCommit, 'clearing the upload intent', [head, parent]);
 }
