@@ -1,0 +1,46 @@
+name: COROS Sync CI
+
+on:
+  pull_request:
+    paths:
+      - 'coros-sync/**'
+      - '.github/scripts/garmin-db-lock.cjs'
+      - '.github/workflows/coros_sync_ci.yml'
+      - '.github/workflows/migrate_garmin_cn_to_coros.yml'
+      - '.github/workflows/sync_garmin_cn_to_coros.yml'
+      - '.github/workflows/migrate_garmin_cn_to_garmin_global.yml'
+      - '.github/workflows/migrate_garmin_global_to_garmin_cn.yml'
+      - '.github/workflows/sync_garmin_cn_to_garmin_global.yml'
+      - '.github/workflows/sync_garmin_global_to_garmin_cn.yml'
+  push:
+    branches:
+      - main
+    paths:
+      - 'coros-sync/**'
+      - '.github/scripts/garmin-db-lock.cjs'
+      - '.github/workflows/coros_sync_ci.yml'
+      - '.github/workflows/migrate_garmin_cn_to_coros.yml'
+      - '.github/workflows/sync_garmin_cn_to_coros.yml'
+      - '.github/workflows/migrate_garmin_cn_to_garmin_global.yml'
+      - '.github/workflows/migrate_garmin_global_to_garmin_cn.yml'
+      - '.github/workflows/sync_garmin_cn_to_garmin_global.yml'
+      - '.github/workflows/sync_garmin_global_to_garmin_cn.yml'
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.19.0
+          run_install: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22.13.0'
+          cache: pnpm
+          cache-dependency-path: coros-sync/pnpm-lock.yaml
+      - run: pnpm --dir coros-sync install --frozen-lockfile
+      - run: pnpm --dir coros-sync typecheck
+      - run: pnpm --dir coros-sync test

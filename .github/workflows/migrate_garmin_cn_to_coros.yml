@@ -1,0 +1,60 @@
+name: Migrate Garmin CN to COROS CN
+
+on:
+  workflow_dispatch:
+
+permissions:
+  actions: read
+  contents: write
+
+jobs:
+  migrate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref_name }}
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.19.0
+          run_install: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22.13.0'
+          cache: pnpm
+          cache-dependency-path: coros-sync/pnpm-lock.yaml
+      - name: Acquire Garmin database writer lock
+        id: garmin_db_lock
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: node .github/scripts/garmin-db-lock.cjs acquire
+      - run: pnpm --dir coros-sync install --frozen-lockfile
+      - name: Migrate Garmin history to COROS
+        env:
+          GARMIN_USERNAME: ${{ secrets.GARMIN_USERNAME }}
+          GARMIN_MIGRATE_NUM: ${{ secrets.GARMIN_MIGRATE_NUM }}
+          GARMIN_MIGRATE_START: ${{ secrets.GARMIN_MIGRATE_START }}
+          GARMIN_MIGRATE_AUTO_PAGE: ${{ secrets.GARMIN_MIGRATE_AUTO_PAGE }}
+          AESKEY: ${{ secrets.AESKEY }}
+          COROS_USERNAME: ${{ secrets.COROS_USERNAME }}
+          COROS_PASSWORD: ${{ secrets.COROS_PASSWORD }}
+          GARMIN_DB_LOCK_COMMIT: ${{ steps.garmin_db_lock.outputs.lock_commit }}
+        shell: bash
+        run: |
+          migrate_start="${GARMIN_MIGRATE_START:-0}"
+          pnpm --dir coros-sync migrate_garmin_cn_to_coros \
+            --time-budget 2700 \
+            --migrate-start "$migrate_start" \
+            --apply
+      - name: Save COROS migration state
+        if: ${{ always() && steps.garmin_db_lock.outputs.acquired == 'true' }}
+        uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: Save COROS Migration State
+          file_pattern: db/garmin.db coros-sync
+      - name: Release Garmin database writer lock
+        if: ${{ always() && steps.garmin_db_lock.outputs.acquired == 'true' }}
+        env:
+          GARMIN_DB_LOCK_COMMIT: ${{ steps.garmin_db_lock.outputs.lock_commit }}
+        run: node .github/scripts/garmin-db-lock.cjs release
