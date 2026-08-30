@@ -22,6 +22,7 @@ const SPORTS: Record<number, string> = {
 };
 const IMPORT_SPORTS = new Set(['running', 'cycling', 'hiking', 'walking', 'climbing', 'swimming', 'strength', 'cardio']);
 const IMPORT_TASK_SCAN_SIZES = [10, 100];
+const ACTIVITY_PAGE_SIZE = 20;
 const DAY_MS = 24 * 60 * 60 * 1000;
 const CHINA_OFFSET_MS = 8 * 60 * 60 * 1000;
 
@@ -166,7 +167,9 @@ export class CorosAdapter implements PlatformAdapter {
     }
 
     async page(cursor: number, window?: ActivityWindow): Promise<{ activities: Activity[]; next: number | null; total: number }> {
-        const params: Record<string, string | number> = { modeList: '', pageNumber: cursor + 1, size: 20 };
+        const pageNumber = Math.floor(cursor / ACTIVITY_PAGE_SIZE) + 1;
+        const pageOffset = cursor % ACTIVITY_PAGE_SIZE;
+        const params: Record<string, string | number> = { modeList: '', pageNumber, size: ACTIVITY_PAGE_SIZE };
         if (window) {
             if (!Number.isFinite(window.start) || !Number.isFinite(window.end) || window.start > window.end) {
                 throw new SyncError('PROTOCOL', 'COROS activity window is invalid.');
@@ -185,12 +188,12 @@ export class CorosAdapter implements PlatformAdapter {
             const totalPages = finiteNumber(data?.totalPage);
             const pastLastPage = pageNumber !== null && totalPages !== null &&
                 Number.isSafeInteger(pageNumber) && Number.isSafeInteger(totalPages) &&
-                pageNumber === cursor + 1 && pageNumber > totalPages;
+                pageNumber === Math.floor(cursor / ACTIVITY_PAGE_SIZE) + 1 && pageNumber > totalPages;
             if (total === 0 || pastLastPage) return { activities: [], next: null, total };
         }
         if (!Array.isArray(data?.dataList)) throw new SyncError('PROTOCOL', 'COROS activity page is missing dataList; scan is incomplete.');
-        const activities = data.dataList.map(normalizeCoros);
-        return { activities, next: activities.length ? cursor + 1 : null, total };
+        const activities = data.dataList.slice(pageOffset).map(normalizeCoros);
+        return { activities, next: activities.length ? pageNumber * ACTIVITY_PAGE_SIZE : null, total };
     }
 
     async download(activity: Activity, directory: string): Promise<string> {

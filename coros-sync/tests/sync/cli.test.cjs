@@ -5,7 +5,7 @@ const fs = require('node:fs/promises');
 const os = require('node:os');
 const path = require('node:path');
 const { parseOptions, loadPrivateEnv, requireBridgeAccounts } = require('../../src/sync/config');
-const { main, acquireAccountLock } = require('../../src/bridge');
+const { main, acquireAccountLock, acquireAccountLocks } = require('../../src/bridge');
 
 const settings = ['COROS_USERNAME', 'COROS_PASSWORD', 'GARMIN_USERNAME', 'GARMIN_PASSWORD', 'AESKEY',
     'GARMIN_SYNC_NUM', 'GARMIN_MIGRATE_NUM', 'GARMIN_MIGRATE_START', 'GARMIN_MIGRATE_AUTO_PAGE', 'GITHUB_ACTIONS'];
@@ -41,9 +41,11 @@ test('migration and daily sync keep separate option sets', async () => {
     await assert.rejects(main('sync', ['--migrate-start', '1']), { code: 'USAGE' });
     assert.equal(await main('migration', ['--help']), 0);
     assert.equal(await main('sync', ['--help']), 0);
+    assert.equal(await main('migration', ['--help'], process.cwd(), 'coros-to-garmin'), 0);
+    assert.equal(await main('sync', ['--help'], process.cwd(), 'coros-to-garmin'), 0);
 });
 
-test('local runs lock each COROS account without touching tracked files', async t => {
+test('local runs lock platform accounts without touching tracked files', async t => {
     const root = await fixture(t);
     const locks = path.join(root, '.local');
     await fs.mkdir(locks, { mode: 0o700 });
@@ -57,6 +59,27 @@ test('local runs lock each COROS account without touching tracked files', async 
 
     const releaseAgain = await acquireAccountLock(locks, 'personal@example.invalid');
     await releaseAgain();
+    assert.deepEqual(await fs.readdir(locks), []);
+});
+
+test('a lock group prevents different COROS accounts from writing the same Garmin account', async t => {
+    const root = await fixture(t);
+    const locks = path.join(root, '.local');
+    await fs.mkdir(locks, { mode: 0o700 });
+    const garmin = 'garmin@example.invalid';
+
+    const releaseFirst = await acquireAccountLocks(locks, [
+        { scope: 'coros-cn', account: 'first@example.invalid' },
+        { scope: 'garmin-cn', account: garmin },
+    ]);
+    await assert.rejects(acquireAccountLocks(locks, [
+        { scope: 'garmin-cn', account: garmin.toUpperCase() },
+        { scope: 'coros-cn', account: 'second@example.invalid' },
+    ]), { code: 'LOCK_HELD' });
+
+    const releaseSecondCoros = await acquireAccountLock(locks, 'second@example.invalid');
+    await releaseSecondCoros();
+    await releaseFirst();
     assert.deepEqual(await fs.readdir(locks), []);
 });
 

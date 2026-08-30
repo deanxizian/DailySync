@@ -31,7 +31,7 @@ class FakeAdapter {
         this.pageSize = 2;
         this.serial = 0;
     }
-    async connect() { return this.identity; }
+    async connect(saved) { this.saved = saved; return this.identity; }
     supports(item) { return item.sport === 'running'; }
     async page(cursor, window) {
         this.pages.push(window ? { cursor, window: clone(window) } : cursor);
@@ -64,7 +64,8 @@ class FakeAdapter {
     async verify(transfer) {
         if (this.onVerify) return this.onVerify(transfer);
         const task = this.tasks.get(transfer.filename);
-        if (!task) return { status: 'unknown', code: 'COROS_TASK_NOT_VISIBLE' };
+        if (!task) return { status: 'unknown', code: this.slot === 'coros-cn'
+            ? 'COROS_TASK_NOT_VISIBLE' : 'GARMIN_UPLOAD_NOT_VISIBLE' };
         if (task.status === 'pending') return { status: 'pending', taskId: task.taskId };
         if (!this.items.some(item => item.id === task.item.id)) this.items.push(task.item);
         return { status: 'accepted', stage: 'finished', taskId: task.taskId };
@@ -75,15 +76,19 @@ class FakeAdapter {
     }
 }
 
-async function harness(t, initial = {}) {
+async function harness(t, initial = {}, direction = 'garmin-to-coros') {
     const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'dailysync-test-'));
     t.after(() => fs.rm(directory, { recursive: true, force: true }));
-    const source = new FakeAdapter('garmin-cn', initial['garmin-cn'] ?? []);
-    const target = new FakeAdapter('coros-cn', initial['coros-cn'] ?? []);
-    const context = { directory, source, target, adapters: { 'garmin-cn': source, 'coros-cn': target } };
+    const adapters = { 'garmin-cn': new FakeAdapter('garmin-cn', initial['garmin-cn'] ?? []),
+        'coros-cn': new FakeAdapter('coros-cn', initial['coros-cn'] ?? []) };
+    const source = adapters[direction === 'garmin-to-coros' ? 'garmin-cn' : 'coros-cn'];
+    const target = adapters[direction === 'garmin-to-coros' ? 'coros-cn' : 'garmin-cn'];
+    const context = { directory, source, target, adapters };
     context.run = async (options = {}, overrides = {}) => {
+        const garminSession = { loginHash: hash('login'), token: { oauth1: {}, oauth2: {} } };
         const engine = new ActivitySynchronizer({ source, target, directory,
-            sourceSession: { loginHash: hash('login'), token: { oauth1: {}, oauth2: {} } },
+            sourceSession: source.slot === 'garmin-cn' ? garminSession : undefined,
+            targetSession: target.slot === 'garmin-cn' ? garminSession : undefined,
             evidence: async file => JSON.parse(await fs.readFile(file, 'utf8')).evidence,
             wait: async () => {}, ...overrides }, { pollAttempts: 2, ...options });
         return engine.run();

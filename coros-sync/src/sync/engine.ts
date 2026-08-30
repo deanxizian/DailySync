@@ -1,12 +1,12 @@
 import { createHash } from 'crypto';
 import fs from 'fs/promises';
 import path from 'path';
-import { Activity, ActivityWindow, activityKey, Evidence, ImportReceipt, PlatformAdapter, SavedSession, Transfer } from './types';
+import { Activity, ActivityWindow, activityKey, Evidence, ImportReceipt, PlatformAdapter, SavedSession, SyncRoute, Transfer } from './types';
 import { readEvidence } from './files';
 import { sleep, SyncError } from './errors';
 
 export interface SyncEvent {
-    route: 'garmin-to-coros';
+    route: SyncRoute;
     source: string;
     status: 'uploaded' | 'existing' | 'review' | 'verifying' | 'failed' | 'unsupported' | 'deferred';
     targetId?: string;
@@ -14,8 +14,18 @@ export interface SyncEvent {
     candidates?: string[];
 }
 
+export type SyncOutcome = 'success' | 'partial' | 'incomplete' | 'failed';
+
+export function syncOutcome(events: SyncEvent[]): SyncOutcome {
+    if (events.some(event => ['verifying', 'deferred'].includes(event.status))) return 'incomplete';
+    if (events.some(event => event.status === 'failed')) {
+        return events.some(event => event.status === 'uploaded') ? 'partial' : 'failed';
+    }
+    return events.some(event => ['review', 'unsupported'].includes(event.status)) ? 'partial' : 'success';
+}
+
 export function syncExitCode(events: SyncEvent[]): number {
-    return events.some(event => ['review', 'verifying', 'failed', 'unsupported', 'deferred'].includes(event.status)) ? 2 : 0;
+    return ['incomplete', 'failed'].includes(syncOutcome(events)) ? 2 : 0;
 }
 
 export interface SyncOptions {
@@ -29,7 +39,8 @@ export interface SyncOptions {
 interface EngineDependencies {
     source: PlatformAdapter;
     target: PlatformAdapter;
-    sourceSession: SavedSession;
+    sourceSession?: SavedSession;
+    targetSession?: SavedSession;
     directory: string;
     evidence?: (file: string) => Promise<Evidence>;
     wait?: (ms: number) => Promise<void>;
@@ -51,6 +62,7 @@ interface ReconcileResult {
 }
 
 const TERMINAL_IMPORT_CODES = new Set(['COROS_IMPORT_ERRORS', 'COROS_TASK_FAILED', 'COROS_TASK_UNRECOGNIZED']);
+const IMPORT_NOT_VISIBLE_CODES = new Set(['COROS_TASK_NOT_VISIBLE', 'GARMIN_UPLOAD_NOT_VISIBLE']);
 
 export async function scanAll(adapter: PlatformAdapter, deadline = Infinity, window?: ActivityWindow,
     initialCursor = 0, limit?: number): Promise<Activity[]> {
@@ -138,7 +150,7 @@ export function sameRecording(a: Evidence, b: Evidence): boolean {
 
 export function transferFor(source: Activity, evidence: Evidence): Transfer {
     const digest = createHash('sha256')
-        .update(`garmin-cn\0${source.id}`)
+        .update(`${source.slot}\0${source.id}`)
         .digest('hex');
     return { sourceId: source.id, filename: `dailysync_${digest.slice(0, 32)}.fit`, evidence: { ...evidence } };
 }
@@ -147,11 +159,16 @@ export class ActivitySynchronizer {
     readonly events: SyncEvent[] = [];
     private readonly files = new Map<string, { file: string; evidence: Evidence }>();
     private targetInventory: Activity[] = [];
+    private readonly route: SyncRoute;
 
-    constructor(private readonly deps: EngineDependencies, private readonly options: SyncOptions = {}) {}
+    constructor(private readonly deps: EngineDependencies, private readonly options: SyncOptions = {}) {
+        if (deps.source.slot === 'garmin-cn' && deps.target.slot === 'coros-cn') this.route = 'garmin-to-coros';
+        else if (deps.source.slot === 'coros-cn' && deps.target.slot === 'garmin-cn') this.route = 'coros-to-garmin';
+        else throw new SyncError('CONFIG', 'The selected synchronization direction is invalid.');
+    }
 
     private event(source: Activity, status: SyncEvent['status'], extra: Partial<SyncEvent> = {}): void {
-        const event: SyncEvent = { route: 'garmin-to-coros', source: activityKey(source.slot, source.id), status, ...extra };
+        const event: SyncEvent = { route: this.route, source: activityKey(source.slot, source.id), status, ...extra };
         this.events.push(event);
         this.deps.emit?.(event);
     }
@@ -251,13 +268,13 @@ export class ActivitySynchronizer {
                     const ambiguous = evidenceMatches.length > 1 ? evidenceMatches : summaryMatches;
                     return { status: 'verifying', code: 'MULTIPLE_TARGETS', candidates: ambiguous.map(item => item.id) };
                 }
-                if (receipt.status === 'unknown' && receipt.code && receipt.code !== 'COROS_TASK_NOT_VISIBLE') {
+                if (receipt.status === 'unknown' && receipt.code && !IMPORT_NOT_VISIBLE_CODES.has(receipt.code)) {
                     return { status: TERMINAL_IMPORT_CODES.has(receipt.code) ? 'failed' : 'verifying', code: receipt.code };
                 }
             }
             if (round + 1 < rounds) await (this.deps.wait ?? sleep)(5000);
         }
-        return { status: 'verifying', code: transfer.receipt?.code ?? 'COROS_IMPORT_PENDING' };
+        return { status: 'verifying', code: transfer.receipt?.code ?? 'IMPORT_PENDING' };
     }
 
     private emitCandidate(source: Activity, result: CandidateResult): void {
@@ -275,7 +292,7 @@ export class ActivitySynchronizer {
 
     async run(): Promise<SyncEvent[]> {
         await this.deps.source.connect(this.deps.sourceSession);
-        await this.deps.target.connect();
+        await this.deps.target.connect(this.deps.targetSession);
 
         const sources = await scanAll(this.deps.source, this.options.deadline, undefined,
             this.options.sourceOffset ?? 0, this.options.sourceLimit);
@@ -283,7 +300,7 @@ export class ActivitySynchronizer {
             .sort((a, b) => a.start - b.start || a.id.localeCompare(b.id));
         const orderedSources = [...sources].sort((a, b) => b.start - a.start || a.id.localeCompare(b.id));
         if (this.options.activityId && !orderedSources.some(activity => activity.id === this.options.activityId)) {
-            throw new SyncError('NOT_FOUND', 'The selected Garmin activity was not found.');
+            throw new SyncError('NOT_FOUND', 'The selected source activity was not found.');
         }
 
         for (const source of orderedSources) {
@@ -317,7 +334,7 @@ export class ActivitySynchronizer {
 
             const transfer = transferFor(source, downloaded.evidence);
             const previous = await this.deps.target.verify(transfer);
-            if (!(previous.status === 'unknown' && previous.code === 'COROS_TASK_NOT_VISIBLE')) {
+            if (!(previous.status === 'unknown' && IMPORT_NOT_VISIBLE_CODES.has(previous.code ?? ''))) {
                 const recovered = await this.reconcile(transfer, previous);
                 this.emitReconcile(source, recovered, 'existing');
                 if (recovered.status === 'verifying' || recovered.status === 'deferred') break;
@@ -342,7 +359,7 @@ export class ActivitySynchronizer {
             this.mergeReceipt(transfer, receipt);
             if (receipt.status === 'failed') {
                 this.event(source, 'failed', { code: receipt.code });
-                if (receipt.code === 'AUTH') throw new SyncError('AUTH', 'COROS authentication failed; uploads stopped.');
+                if (receipt.code === 'AUTH') throw new SyncError('AUTH', 'Target authentication failed; uploads stopped.');
                 continue;
             }
             if (receipt.status === 'retryable') {

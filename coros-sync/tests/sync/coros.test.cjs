@@ -80,9 +80,9 @@ test('COROS pagination preserves int64 IDs, UTC time and an explicit empty end p
             : success({ count: 1, pageNumber: 2, totalPage: 1 })
         : undefined);
     await f.adapter.connect();
-    const first = await f.adapter.page(0), last = await f.adapter.page(1);
-    assert.equal(first.next, 1);
-    assert.deepEqual(first, { activities: [{ ...activity('coros-cn', row.labelId), sportCode: 100 }], next: 1, total: 1 });
+    const first = await f.adapter.page(0), last = await f.adapter.page(20);
+    assert.equal(first.next, 20);
+    assert.deepEqual(first, { activities: [{ ...activity('coros-cn', row.labelId), sportCode: 100 }], next: 20, total: 1 });
     assert.deepEqual(last, { activities: [], next: null, total: 1 });
     assert.deepEqual(f.calls.at(-2).params, { modeList: '', pageNumber: 1, size: 20 });
     assert.throws(() => normalizeCoros({ ...row, labelId: Number(row.labelId) }), { code: 'PROTOCOL' });
@@ -102,11 +102,25 @@ test('COROS full scans accept an omitted list only after the echoed last page', 
     assert.deepEqual(f.calls.filter(call => call.url.endsWith('/activity/query')).map(call => call.params.pageNumber), [1, 2]);
 });
 
+test('COROS pagination treats cursors as activity offsets for migration starts', async () => {
+    const page = [
+        { ...row, labelId: 'offset20' },
+        { ...row, labelId: 'offset21', startTime: start / 1000 - 1 },
+    ];
+    const f = fixture(config => config.url.endsWith('/activity/query')
+        ? success({ count: 22, pageNumber: 2, totalPage: 2, dataList: page }) : undefined);
+    await f.adapter.connect();
+    const result = await f.adapter.page(21);
+    assert.deepEqual(result.activities.map(item => item.id), ['offset21']);
+    assert.equal(result.next, 40);
+    assert.equal(f.calls.at(-1).params.pageNumber, 2);
+});
+
 test('COROS verification windows become bounded China calendar-day queries', async () => {
     const f = fixture(config => config.url.endsWith('/activity/query') ? success({ count: 0 }) : undefined);
     await f.adapter.connect();
     const start = Date.parse('2025-04-06T16:30:00Z');
-    await f.adapter.page(2, { start, end: start + 60000 });
+    await f.adapter.page(40, { start, end: start + 60000 });
     const query = f.calls.find(call => call.url.endsWith('/activity/query')).params;
     assert.deepEqual(query, { modeList: '', pageNumber: 3, size: 20, startDay: '20250406', endDay: '20250408' });
 });

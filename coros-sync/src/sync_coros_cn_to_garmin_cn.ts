@@ -1,3 +1,3 @@
 import { runCli } from './bridge';
 
-runCli('sync', 'garmin-to-coros');
+runCli('sync', 'coros-to-garmin');
