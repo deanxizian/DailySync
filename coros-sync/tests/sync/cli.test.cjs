@@ -135,3 +135,8 @@ test('runtime code has no persistent synchronization-state dependency', async ()
         assert.equal(source.includes(term), false, term);
     }
 });
+
+test('only daily sync gets the default GitHub Actions time budget', async () => {
+    const source = await fs.readFile(path.resolve(__dirname, '../../src/bridge.ts'), 'utf8');
+    assert.match(source, /profile === 'sync' && process\.env\.GITHUB_ACTIONS === 'true' \? 2700 : undefined/);
+});

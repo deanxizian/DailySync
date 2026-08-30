@@ -153,7 +153,8 @@ export async function main(profile: BridgeProfile, args = process.argv.slice(2),
         profile === 'migration' ? 100 : 10);
     const sourceOffset = profile === 'migration' ? Math.max(0, migrationStartSetting(options.migrateStart) - 1) : 0;
     const sourceLimit = profile === 'migration' && !autoPageEnabled() ? pageSize : undefined;
-    const timeBudget = options.timeBudget ?? (process.env.GITHUB_ACTIONS === 'true' ? 2700 : undefined);
+    const timeBudget = options.timeBudget ??
+        (profile === 'sync' && process.env.GITHUB_ACTIONS === 'true' ? 2700 : undefined);
     const base = path.join(root, 'coros-sync', '.local');
     await fs.mkdir(base, { recursive: true, mode: 0o700 });
     await fs.chmod(base, 0o700);
