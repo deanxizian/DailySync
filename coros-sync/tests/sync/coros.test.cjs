@@ -325,7 +325,7 @@ test('COROS verification expands beyond the ten newest import tasks', async t =>
     assert.deepEqual(requested, [10, 100]);
 });
 
-test('COROS treats a saturated import task query as incomplete', async t => {
+test('COROS caps preflight task scans at the supported maximum', async t => {
     const requested = [];
     const f = await uploadFixture(t, config => {
         if (!config.url.endsWith('/activity/fit/getImportSportList')) return undefined;
@@ -335,8 +335,23 @@ test('COROS treats a saturated import task query as incomplete', async t => {
         })));
     });
     assert.deepEqual(await f.adapter.verify(f.transfer),
+        { status: 'unknown', code: 'COROS_TASK_NOT_VISIBLE' });
+    assert.deepEqual(requested, [10, 100]);
+});
+
+test('COROS treats a saturated post-submission task query as incomplete', async t => {
+    const requested = [];
+    const f = await uploadFixture(t, config => {
+        if (!config.url.endsWith('/activity/fit/getImportSportList')) return undefined;
+        requested.push(config.data.size);
+        return success(Array.from({ length: config.data.size }, (_, index) => ({
+            id: `other-${index}`, originalFilename: `other-${index}.fit`, status: 2, errorSize: 0, finishSize: 1,
+        })));
+    });
+    f.transfer.receipt = { status: 'unknown', code: 'COROS_IMPORT_UNKNOWN' };
+    assert.deepEqual(await f.adapter.verify(f.transfer),
         { status: 'unknown', code: 'COROS_TASK_SCAN_INCOMPLETE' });
-    assert.deepEqual(requested, [10, 100, 1000]);
+    assert.deepEqual(requested, [10, 100]);
 });
 
 test('COROS failed staging or invalid files never submit an import', async t => {
