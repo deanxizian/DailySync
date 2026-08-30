@@ -24,6 +24,7 @@ env:
   GARMIN_GLOBAL_PASSWORD: ${{ secrets.GARMIN_GLOBAL_PASSWORD }}
   GARMIN_MIGRATE_NUM: ${{ secrets.GARMIN_MIGRATE_NUM }}
   GARMIN_MIGRATE_START: ${{ secrets.GARMIN_MIGRATE_START }}
+  GARMIN_MIGRATE_AUTO_PAGE: ${{ secrets.GARMIN_MIGRATE_AUTO_PAGE }}
   # Wellness 健康数据默认关闭；需要迁移步数、睡眠、HRV、压力等数据时，在 Secrets 中设置 GARMIN_SYNC_WELLNESS=true
   GARMIN_SYNC_WELLNESS: ${{ secrets.GARMIN_SYNC_WELLNESS }}
   # 历史迁移健康数据天数；未配置或 0 表示不迁移历史健康数据

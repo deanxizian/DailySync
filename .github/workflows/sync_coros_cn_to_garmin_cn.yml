@@ -1,7 +1,12 @@
-name: Migrate Garmin CN to COROS CN
+name: Sync COROS CN to Garmin CN
 
 on:
   workflow_dispatch:
+    inputs:
+      activity_id:
+        description: Optional COROS CN activity ID
+        type: string
+        default: ''
 
 concurrency:
   group: dailysync-garmin-cn-coros-cn
@@ -11,7 +16,7 @@ permissions:
   contents: read
 
 jobs:
-  migrate:
+  sync:
     runs-on: ubuntu-latest
     timeout-minutes: 360
     steps:
@@ -29,17 +34,16 @@ jobs:
           cache: pnpm
           cache-dependency-path: coros-sync/pnpm-lock.yaml
       - run: pnpm --dir coros-sync install --frozen-lockfile
-      - name: Migrate Garmin history to COROS
+      - name: Sync COROS activities to Garmin
         env:
           GARMIN_USERNAME: ${{ secrets.GARMIN_USERNAME }}
-          GARMIN_MIGRATE_NUM: ${{ secrets.GARMIN_MIGRATE_NUM }}
-          GARMIN_MIGRATE_START: ${{ secrets.GARMIN_MIGRATE_START }}
-          GARMIN_MIGRATE_AUTO_PAGE: ${{ secrets.GARMIN_MIGRATE_AUTO_PAGE }}
+          GARMIN_SYNC_NUM: ${{ secrets.GARMIN_SYNC_NUM }}
           AESKEY: ${{ secrets.AESKEY }}
           COROS_USERNAME: ${{ secrets.COROS_USERNAME }}
           COROS_PASSWORD: ${{ secrets.COROS_PASSWORD }}
+          SYNC_ACTIVITY_ID: ${{ inputs.activity_id }}
         shell: bash
         run: |
-          migrate_start="${GARMIN_MIGRATE_START:-0}"
-          pnpm --dir coros-sync migrate_garmin_cn_to_coros \
-            --migrate-start "$migrate_start"
+          args=(--time-budget 2700)
+          if [[ -n "$SYNC_ACTIVITY_ID" ]]; then args+=(--activity-id "$SYNC_ACTIVITY_ID"); fi
+          pnpm --dir coros-sync sync_coros_cn_to_garmin_cn "${args[@]}"

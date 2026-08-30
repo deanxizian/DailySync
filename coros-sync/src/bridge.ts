@@ -1,14 +1,16 @@
 import fs from 'fs/promises';
 import path from 'path';
 import { createHash, randomUUID } from 'crypto';
-import { ActivitySynchronizer, SyncEvent, syncExitCode } from './sync/engine';
+import { ActivitySynchronizer, SyncEvent, syncExitCode, syncOutcome } from './sync/engine';
 import { CorosAdapter } from './sync/coros';
-import { GarminCnReadOnlyAdapter } from './sync/garmin';
+import { GarminCnReadOnlyAdapter, GarminCnUploadAdapter } from './sync/garmin';
 import { readGarminCnSession } from './sync/garmin-db';
 import { CliOptions, loadPrivateEnv, parseOptions, requireBridgeAccounts } from './sync/config';
 import { safeError, SyncError } from './sync/errors';
 
 export type BridgeProfile = 'migration' | 'sync';
+export type BridgeDirection = 'garmin-to-coros' | 'coros-to-garmin';
+export type AccountLockScope = 'coros-cn' | 'garmin-cn';
 
 async function reclaimDeadLock(filename: string): Promise<boolean> {
     let current: string;
@@ -44,9 +46,10 @@ async function reclaimDeadLock(filename: string): Promise<boolean> {
     }
 }
 
-export async function acquireAccountLock(directory: string, account: string): Promise<() => Promise<void>> {
+export async function acquireAccountLock(directory: string, account: string,
+    scope: AccountLockScope = 'coros-cn'): Promise<() => Promise<void>> {
     const accountHash = createHash('sha256').update(account.trim().toLowerCase()).digest('hex').slice(0, 24);
-    const filename = path.join(directory, `coros-${accountHash}.lock`);
+    const filename = path.join(directory, `${scope}-${accountHash}.lock`);
     const token = JSON.stringify({ token: randomUUID(), pid: process.pid, createdAt: new Date().toISOString() });
     let acquired = false;
     for (let attempt = 0; attempt < 3 && !acquired; attempt++) {
@@ -65,12 +68,12 @@ export async function acquireAccountLock(directory: string, account: string): Pr
             if (created) await fs.unlink(filename).catch(() => {});
             if (!created && (error as NodeJS.ErrnoException).code === 'EEXIST') {
                 if (await reclaimDeadLock(filename)) continue;
-                throw new SyncError('LOCK_HELD', 'Another local COROS migration or sync is already running for this account.');
+                throw new SyncError('LOCK_HELD', `Another local migration or sync is already using this ${scope} account.`);
             }
             throw new SyncError('LOCK_CREATE', 'Cannot create the local COROS account lock.');
         }
     }
-    if (!acquired) throw new SyncError('LOCK_HELD', 'Another local COROS migration or sync is already running for this account.');
+    if (!acquired) throw new SyncError('LOCK_HELD', `Another local migration or sync is already using this ${scope} account.`);
     return async () => {
         let current: string;
         try { current = await fs.readFile(filename, 'utf8'); }
@@ -81,21 +84,41 @@ export async function acquireAccountLock(directory: string, account: string): Pr
     };
 }
 
-const HELP: Record<BridgeProfile, string> = {
-    migration: `DailySync historical migration: Garmin CN -> COROS CN
+export async function acquireAccountLocks(directory: string,
+    accounts: Array<{ scope: AccountLockScope; account: string }>): Promise<() => Promise<void>> {
+    const ordered = [...accounts].sort((left, right) =>
+        `${left.scope}:${left.account.trim().toLowerCase()}`.localeCompare(
+            `${right.scope}:${right.account.trim().toLowerCase()}`));
+    const releases: Array<() => Promise<void>> = [];
+    try {
+        for (const { scope, account } of ordered) {
+            releases.push(await acquireAccountLock(directory, account, scope));
+        }
+    } catch (error) {
+        for (const release of releases.reverse()) await release().catch(() => {});
+        throw error;
+    }
+    return async () => {
+        let releaseError: unknown;
+        for (const release of releases.reverse()) {
+            try { await release(); }
+            catch (error) { releaseError ??= error; }
+        }
+        if (releaseError) throw releaseError;
+    };
+}
 
-pnpm --dir coros-sync migrate_garmin_cn_to_coros
-
-Options: --migrate-start N, --time-budget SECONDS, --json
-GARMIN_MIGRATE_START is 1-based; 0 and 1 both start with the newest activity.
-`,
-    sync: `DailySync activity sync: Garmin CN -> COROS CN
-
-pnpm --dir coros-sync sync_garmin_cn_to_coros
-
-Options: --activity-id ID, --time-budget SECONDS, --json
-`,
-};
+function help(profile: BridgeProfile, direction: BridgeDirection): string {
+    const command = profile === 'migration'
+        ? direction === 'garmin-to-coros' ? 'migrate_garmin_cn_to_coros' : 'migrate_coros_cn_to_garmin_cn'
+        : direction === 'garmin-to-coros' ? 'sync_garmin_cn_to_coros' : 'sync_coros_cn_to_garmin_cn';
+    const label = direction === 'garmin-to-coros' ? 'Garmin CN -> COROS CN' : 'COROS CN -> Garmin CN';
+    const options = profile === 'migration'
+        ? '--migrate-start N, --time-budget SECONDS, --json\nGARMIN_MIGRATE_START is 1-based; 0 and 1 both start with the newest activity.'
+        : '--activity-id ID, --time-budget SECONDS, --json';
+    return `DailySync ${profile === 'migration' ? 'historical migration' : 'activity sync'}: ${label}\n\n` +
+        `pnpm --dir coros-sync ${command}\n\nOptions: ${options}\n`;
+}
 
 function countSetting(name: string, fallback: number): number {
     const raw = process.env[name];
@@ -139,10 +162,10 @@ function validateProfile(profile: BridgeProfile, options: CliOptions): void {
 }
 
 export async function main(profile: BridgeProfile, args = process.argv.slice(2),
-    root = path.resolve(__dirname, '..', '..')): Promise<number> {
+    root = path.resolve(__dirname, '..', '..'), direction: BridgeDirection = 'garmin-to-coros'): Promise<number> {
     const options = parseOptions(args);
     if (options.help) {
-        console.log(HELP[profile]);
+        console.log(help(profile, direction));
         return 0;
     }
     validateProfile(profile, options);
@@ -158,15 +181,25 @@ export async function main(profile: BridgeProfile, args = process.argv.slice(2),
     const base = path.join(root, 'coros-sync', '.local');
     await fs.mkdir(base, { recursive: true, mode: 0o700 });
     await fs.chmod(base, 0o700);
-    const releaseLock = await acquireAccountLock(base, process.env.COROS_USERNAME!);
+    const releaseLocks = await acquireAccountLocks(base, [
+        { scope: 'coros-cn', account: process.env.COROS_USERNAME! },
+        { scope: 'garmin-cn', account: process.env.GARMIN_USERNAME! },
+    ]);
     let directory: string | undefined;
 
     try {
         directory = await fs.mkdtemp(path.join(base, 'run-'));
-        const sourceSession = await readGarminCnSession(root, process.env.GARMIN_USERNAME!);
-        const source = new GarminCnReadOnlyAdapter(process.env.GARMIN_USERNAME!, undefined, undefined, pageSize);
-        const target = new CorosAdapter({ username: process.env.COROS_USERNAME!, password: process.env.COROS_PASSWORD! });
-        const engine = new ActivitySynchronizer({ source, target, sourceSession, directory,
+        const garminSession = await readGarminCnSession(root, process.env.GARMIN_USERNAME!);
+        const coros = new CorosAdapter({ username: process.env.COROS_USERNAME!, password: process.env.COROS_PASSWORD! });
+        const garmin = direction === 'garmin-to-coros'
+            ? new GarminCnReadOnlyAdapter(process.env.GARMIN_USERNAME!, undefined, undefined, pageSize)
+            : new GarminCnUploadAdapter(process.env.GARMIN_USERNAME!, undefined, undefined, pageSize);
+        const source = direction === 'garmin-to-coros' ? garmin : coros;
+        const target = direction === 'garmin-to-coros' ? coros : garmin;
+        const engine = new ActivitySynchronizer({ source, target,
+            sourceSession: direction === 'garmin-to-coros' ? garminSession : undefined,
+            targetSession: direction === 'coros-to-garmin' ? garminSession : undefined,
+            directory,
             emit: options.json ? undefined : event => {
                 if (event.status !== 'existing') {
                     console.log(`${event.source} ${event.status}${event.code ? ` (${event.code})` : ''}` +
@@ -179,7 +212,8 @@ export async function main(profile: BridgeProfile, args = process.argv.slice(2),
             deadline: timeBudget ? Date.now() + timeBudget * 1000 : undefined,
         });
         const events = await engine.run();
-        const result = { task: profile, direction: 'garmin-cn-to-coros-cn', summary: summarize(events) };
+        const result = { task: profile, direction: direction === 'garmin-to-coros'
+            ? 'garmin-cn-to-coros-cn' : 'coros-cn-to-garmin-cn', outcome: syncOutcome(events), summary: summarize(events) };
         console.log(JSON.stringify(options.json ? { ...result, events } : result, null, 2));
         return syncExitCode(events);
     } finally {
@@ -188,13 +222,13 @@ export async function main(profile: BridgeProfile, args = process.argv.slice(2),
             try { await fs.rm(directory, { recursive: true, force: true }); }
             catch (error) { cleanupError = error; }
         }
-        try { await releaseLock(); }
+        try { await releaseLocks(); }
         catch (error) { cleanupError ??= error; }
         if (cleanupError) throw cleanupError;
     }
 }
 
-export function runCli(profile: BridgeProfile): void {
-    main(profile).then(code => { process.exitCode = code; })
+export function runCli(profile: BridgeProfile, direction: BridgeDirection = 'garmin-to-coros'): void {
+    main(profile, process.argv.slice(2), path.resolve(__dirname, '..', '..'), direction).then(code => { process.exitCode = code; })
         .catch(error => { console.error(safeError(error)); process.exitCode = 1; });
 }

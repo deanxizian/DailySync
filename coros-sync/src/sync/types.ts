@@ -1,5 +1,6 @@
 export const SLOTS = ['garmin-cn', 'coros-cn'] as const;
 export type Slot = typeof SLOTS[number];
+export type SyncRoute = 'garmin-to-coros' | 'coros-to-garmin';
 
 export interface Activity {
     slot: Slot;

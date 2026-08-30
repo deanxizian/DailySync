@@ -1,12 +1,10 @@
-name: Sync Garmin CN to COROS CN
+name: Sync Garmin CN and COROS CN
 
 on:
   workflow_dispatch:
-    inputs:
-      activity_id:
-        description: Optional Garmin CN activity ID
-        type: string
-        default: ''
+  schedule:
+    # Run two hours after the original Garmin workflows.
+    - cron: '0 2,8,14,20 * * *'
 
 concurrency:
   group: dailysync-garmin-cn-coros-cn
@@ -35,15 +33,25 @@ jobs:
           cache-dependency-path: coros-sync/pnpm-lock.yaml
       - run: pnpm --dir coros-sync install --frozen-lockfile
       - name: Sync Garmin activities to COROS
+        id: garmin_to_coros
+        continue-on-error: true
         env:
           GARMIN_USERNAME: ${{ secrets.GARMIN_USERNAME }}
           GARMIN_SYNC_NUM: ${{ secrets.GARMIN_SYNC_NUM }}
           AESKEY: ${{ secrets.AESKEY }}
           COROS_USERNAME: ${{ secrets.COROS_USERNAME }}
           COROS_PASSWORD: ${{ secrets.COROS_PASSWORD }}
-          SYNC_ACTIVITY_ID: ${{ inputs.activity_id }}
-        shell: bash
-        run: |
-          args=(--time-budget 2700)
-          if [[ -n "$SYNC_ACTIVITY_ID" ]]; then args+=(--activity-id "$SYNC_ACTIVITY_ID"); fi
-          pnpm --dir coros-sync sync_garmin_cn_to_coros "${args[@]}"
+        run: pnpm --dir coros-sync sync_garmin_cn_to_coros --time-budget 2700
+      - name: Sync COROS activities to Garmin
+        id: coros_to_garmin
+        continue-on-error: true
+        env:
+          GARMIN_USERNAME: ${{ secrets.GARMIN_USERNAME }}
+          GARMIN_SYNC_NUM: ${{ secrets.GARMIN_SYNC_NUM }}
+          AESKEY: ${{ secrets.AESKEY }}
+          COROS_USERNAME: ${{ secrets.COROS_USERNAME }}
+          COROS_PASSWORD: ${{ secrets.COROS_PASSWORD }}
+        run: pnpm --dir coros-sync sync_coros_cn_to_garmin_cn --time-budget 2700
+      - name: Check synchronization results
+        if: ${{ always() && (steps.garmin_to_coros.outcome == 'failure' || steps.coros_to_garmin.outcome == 'failure') }}
+        run: exit 1

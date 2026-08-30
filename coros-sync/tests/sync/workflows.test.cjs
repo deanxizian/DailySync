@@ -9,10 +9,13 @@ const root = path.resolve(__dirname, '../../..');
 const workflowPath = name => path.join(root, '.github/workflows', name);
 const read = name => YAML.parse(fs.readFileSync(workflowPath(name), 'utf8'), { uniqueKeys: true });
 const raw = name => fs.readFileSync(workflowPath(name), 'utf8');
-const concurrency = { group: 'dailysync-garmin-cn-to-coros', 'cancel-in-progress': false };
+const concurrency = { group: 'dailysync-garmin-cn-coros-cn', 'cancel-in-progress': false };
 const corosWorkflows = [
     ['migrate_garmin_cn_to_coros.yml', 'migrate'],
+    ['migrate_coros_cn_to_garmin_cn.yml', 'migrate'],
     ['sync_garmin_cn_to_coros.yml', 'sync'],
+    ['sync_coros_cn_to_garmin_cn.yml', 'sync'],
+    ['sync_garmin_cn_coros_cn.yml', 'sync'],
 ];
 const originalWorkflows = [
     ['migrate_garmin_cn_to_garmin_global.yml', 'build'],
@@ -21,20 +24,28 @@ const originalWorkflows = [
     ['sync_garmin_global_to_garmin_cn.yml', 'build'],
 ];
 
-test('migration and daily sync are separate stateless Actions', () => {
+test('directional and scheduled bidirectional sync are stateless Actions', () => {
     for (const filename of fs.readdirSync(path.join(root, '.github/workflows'))) {
         if (!filename.endsWith('.yml')) continue;
         assert.ok(read(filename).jobs);
     }
 
     const migration = read('migrate_garmin_cn_to_coros.yml');
+    const reverseMigration = read('migrate_coros_cn_to_garmin_cn.yml');
     const sync = read('sync_garmin_cn_to_coros.yml');
+    const reverseSync = read('sync_coros_cn_to_garmin_cn.yml');
+    const scheduledSync = read('sync_garmin_cn_coros_cn.yml');
     assert.ok(Object.prototype.hasOwnProperty.call(migration.on, 'workflow_dispatch'));
+    assert.ok(Object.prototype.hasOwnProperty.call(reverseMigration.on, 'workflow_dispatch'));
     assert.equal(migration.on.schedule, undefined);
+    assert.equal(reverseMigration.on.schedule, undefined);
     assert.equal(migration.on.push, undefined);
-    assert.deepEqual(sync.on.schedule, [{ cron: '0 2,8,14,20 * * *' }]);
+    assert.equal(sync.on.schedule, undefined);
+    assert.equal(reverseSync.on.schedule, undefined);
+    assert.deepEqual(scheduledSync.on.schedule, [{ cron: '0 2,8,14,20 * * *' }]);
     assert.equal(sync.on.push, undefined);
     assert.equal(sync.on.workflow_dispatch.inputs.activity_id.type, 'string');
+    assert.equal(reverseSync.on.workflow_dispatch.inputs.activity_id.type, 'string');
     assert.equal(fs.existsSync(workflowPath('manage_garmin_cn_to_coros.yml')), false);
 
     for (const [filename, jobName] of corosWorkflows) {
@@ -55,8 +66,12 @@ test('migration and daily sync are separate stateless Actions', () => {
     assert.match(raw('migrate_garmin_cn_to_coros.yml'), /secrets\.GARMIN_MIGRATE_NUM/);
     assert.match(raw('migrate_garmin_cn_to_coros.yml'), /secrets\.GARMIN_MIGRATE_START/);
     assert.match(raw('migrate_garmin_cn_to_coros.yml'), /secrets\.GARMIN_MIGRATE_AUTO_PAGE/);
+    assert.match(raw('migrate_coros_cn_to_garmin_cn.yml'), /secrets\.GARMIN_MIGRATE_AUTO_PAGE/);
     assert.equal(raw('sync_garmin_cn_to_coros.yml').includes('GARMIN_MIGRATE'), false);
+    assert.equal(raw('sync_coros_cn_to_garmin_cn.yml').includes('GARMIN_MIGRATE'), false);
     assert.match(raw('sync_garmin_cn_to_coros.yml'), /secrets\.GARMIN_SYNC_NUM/);
+    assert.match(raw('sync_coros_cn_to_garmin_cn.yml'), /secrets\.GARMIN_SYNC_NUM/);
+    assert.match(raw('sync_garmin_cn_coros_cn.yml'), /secrets\.GARMIN_SYNC_NUM/);
 });
 
 test('original Garmin commands and scheduling stay independent', () => {
@@ -92,6 +107,12 @@ test('original Garmin commands and scheduling stay independent', () => {
         assert.equal(raw(filename).includes('garmin-db-lock'), false);
         assert.equal(raw(filename).includes('wait-for-garmin-db-writer'), false);
     }
+    for (const filename of ['migrate_garmin_cn_to_garmin_global.yml', 'migrate_garmin_global_to_garmin_cn.yml']) {
+        assert.match(raw(filename), /GARMIN_MIGRATE_AUTO_PAGE: \$\{\{ secrets\.GARMIN_MIGRATE_AUTO_PAGE \}\}/);
+    }
+    for (const filename of ['sync_garmin_cn_to_garmin_global.yml', 'sync_garmin_global_to_garmin_cn.yml']) {
+        assert.match(raw(filename), /GARMIN_SYNC_NUM: \$\{\{ secrets\.GARMIN_SYNC_NUM \}\}/);
+    }
     for (const filename of ['src/utils/garmin_cn.ts', 'src/utils/garmin_global.ts', 'src/utils/garmin_common.ts', 'src/utils/garmin_wellness.ts']) {
         assert.equal(fs.readFileSync(path.join(root, filename), 'utf8').includes("from '../sync/"), false);
     }
@@ -101,7 +122,9 @@ test('original Garmin commands and scheduling stay independent', () => {
 test('the COROS package contains no persistent state or Git writer', () => {
     const childPackage = JSON.parse(fs.readFileSync(path.join(root, 'coros-sync/package.json'), 'utf8'));
     assert.equal(childPackage.scripts.migrate_garmin_cn_to_coros, 'ts-node src/migrate_garmin_cn_to_coros.ts');
+    assert.equal(childPackage.scripts.migrate_coros_cn_to_garmin_cn, 'ts-node src/migrate_coros_cn_to_garmin_cn.ts');
     assert.equal(childPackage.scripts.sync_garmin_cn_to_coros, 'ts-node src/sync_garmin_cn_to_coros.ts');
+    assert.equal(childPackage.scripts.sync_coros_cn_to_garmin_cn, 'ts-node src/sync_coros_cn_to_garmin_cn.ts');
     assert.equal(childPackage.scripts.initialize_garmin_cn_to_coros_state, undefined);
 
     for (const filename of ['initialize_garmin_cn_to_coros_state.ts', 'sync/state.ts', 'sync/workspace.ts',
@@ -124,7 +147,10 @@ test('the COROS package contains no persistent state or Git writer', () => {
     assert.ok(childCi.jobs.test.steps.some(step => step.run === 'pnpm --dir coros-sync typecheck'));
     const ciText = raw('coros_sync_ci.yml');
     assert.match(ciText, /migrate_garmin_cn_to_coros\.yml/);
+    assert.match(ciText, /migrate_coros_cn_to_garmin_cn\.yml/);
     assert.match(ciText, /sync_garmin_cn_to_coros\.yml/);
+    assert.match(ciText, /sync_coros_cn_to_garmin_cn\.yml/);
+    assert.match(ciText, /sync_garmin_cn_coros_cn\.yml/);
     for (const [filename] of originalWorkflows) assert.equal(ciText.includes(filename), false);
 
     const readme = fs.readFileSync(path.join(root, 'coros-sync/README.md'), 'utf8');
@@ -140,18 +166,39 @@ function shell(step, env) {
 }
 
 test('migration workflow uses only migration parameters', () => {
-    const step = read('migrate_garmin_cn_to_coros.yml').jobs.migrate.steps
-        .find(item => item.name === 'Migrate Garmin history to COROS');
-    assert.deepEqual(shell(step, { GARMIN_MIGRATE_NUM: '100', GARMIN_MIGRATE_START: '21' }),
-        ['--dir', 'coros-sync', 'migrate_garmin_cn_to_coros', '--migrate-start', '21']);
+    for (const [filename, name, command] of [
+        ['migrate_garmin_cn_to_coros.yml', 'Migrate Garmin history to COROS', 'migrate_garmin_cn_to_coros'],
+        ['migrate_coros_cn_to_garmin_cn.yml', 'Migrate COROS history to Garmin', 'migrate_coros_cn_to_garmin_cn'],
+    ]) {
+        const step = read(filename).jobs.migrate.steps.find(item => item.name === name);
+        assert.deepEqual(shell(step, { GARMIN_MIGRATE_NUM: '100', GARMIN_MIGRATE_START: '21' }),
+            ['--dir', 'coros-sync', command, '--migrate-start', '21']);
+    }
 });
 
 test('sync workflow preserves an activity ID without shell evaluation', () => {
-    const step = read('sync_garmin_cn_to_coros.yml').jobs.sync.steps
-        .find(item => item.name === 'Sync Garmin activities to COROS');
-    assert.deepEqual(shell(step, { SYNC_ACTIVITY_ID: '' }),
-        ['--dir', 'coros-sync', 'sync_garmin_cn_to_coros', '--time-budget', '2700']);
-    assert.deepEqual(shell(step, { SYNC_ACTIVITY_ID: '$(printf injected)' }),
-        ['--dir', 'coros-sync', 'sync_garmin_cn_to_coros', '--time-budget', '2700',
-            '--activity-id', '$(printf injected)']);
+    for (const [filename, name, command] of [
+        ['sync_garmin_cn_to_coros.yml', 'Sync Garmin activities to COROS', 'sync_garmin_cn_to_coros'],
+        ['sync_coros_cn_to_garmin_cn.yml', 'Sync COROS activities to Garmin', 'sync_coros_cn_to_garmin_cn'],
+    ]) {
+        const step = read(filename).jobs.sync.steps.find(item => item.name === name);
+        assert.deepEqual(shell(step, { SYNC_ACTIVITY_ID: '' }),
+            ['--dir', 'coros-sync', command, '--time-budget', '2700']);
+        assert.deepEqual(shell(step, { SYNC_ACTIVITY_ID: '$(printf injected)' }),
+            ['--dir', 'coros-sync', command, '--time-budget', '2700', '--activity-id', '$(printf injected)']);
+    }
+});
+
+test('scheduled sync runs both directions and reports either failure', () => {
+    const workflow = read('sync_garmin_cn_coros_cn.yml');
+    const steps = workflow.jobs.sync.steps;
+    const forward = steps.find(item => item.id === 'garmin_to_coros');
+    const reverse = steps.find(item => item.id === 'coros_to_garmin');
+    const result = steps.find(item => item.name === 'Check synchronization results');
+    assert.equal(forward['continue-on-error'], true);
+    assert.equal(reverse['continue-on-error'], true);
+    assert.equal(forward.run, 'pnpm --dir coros-sync sync_garmin_cn_to_coros --time-budget 2700');
+    assert.equal(reverse.run, 'pnpm --dir coros-sync sync_coros_cn_to_garmin_cn --time-budget 2700');
+    assert.match(result.if, /garmin_to_coros\.outcome == 'failure'/);
+    assert.match(result.if, /coros_to_garmin\.outcome == 'failure'/);
 });

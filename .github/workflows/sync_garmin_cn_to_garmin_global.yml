@@ -35,6 +35,7 @@ env:
   GARMIN_PASSWORD: ${{ secrets.GARMIN_PASSWORD }}
   GARMIN_GLOBAL_USERNAME: ${{ secrets.GARMIN_GLOBAL_USERNAME }}
   GARMIN_GLOBAL_PASSWORD: ${{ secrets.GARMIN_GLOBAL_PASSWORD }}
+  GARMIN_SYNC_NUM: ${{ secrets.GARMIN_SYNC_NUM }}
   # Wellness 健康数据默认关闭；需要同步步数、睡眠、HRV、压力等数据时，在 Secrets 中设置 GARMIN_SYNC_WELLNESS=true
   GARMIN_SYNC_WELLNESS: ${{ secrets.GARMIN_SYNC_WELLNESS }}
   # 日常同步时检查最近几天的健康数据；未配置时默认为 1

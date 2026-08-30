@@ -10,7 +10,7 @@ const sqlite3 = require('sqlite3');
 const { open } = require('sqlite');
 const CryptoJS = require('crypto-js');
 const { GarminConnect } = require('@gooin/garmin-connect');
-const { GarminCnReadOnlyAdapter, normalizeGarmin, garminLoginHash } = require('../../src/sync/garmin');
+const { GarminCnReadOnlyAdapter, GarminCnUploadAdapter, normalizeGarmin, garminLoginHash } = require('../../src/sync/garmin');
 const { readGarminCnSession } = require('../../src/sync/garmin-db');
 const { safeError } = require('../../src/sync/errors');
 const { activity, hash, start } = require('./helpers.cjs');
@@ -22,7 +22,7 @@ const profile = { profileId: 123, displayName: 'display-name' };
 const row = { activityId: 321, startTimeGMT: '2025-04-06 03:00:00', startTimeLocal: '2025-04-06 11:00:00',
     activityType: { typeKey: 'trail_running' }, duration: 1800, distance: 5000 };
 
-function fixture(handler, pageSize) {
+function fixture(handler, pageSize, writable = false) {
     const calls = [], waits = [];
     const f = { calls, waits, logins: 0, refreshes: 0 };
     const log = console.log;
@@ -31,7 +31,8 @@ function fixture(handler, pageSize) {
     finally { console.log = log; }
     const client = f.client;
     client.login = async () => { f.logins++; throw new Error('Password login must never be called'); };
-    f.adapter = new GarminCnReadOnlyAdapter(username, client, async delay => { waits.push(delay); }, pageSize);
+    const Adapter = writable ? GarminCnUploadAdapter : GarminCnReadOnlyAdapter;
+    f.adapter = new Adapter(username, client, async delay => { waits.push(delay); }, pageSize);
     client.client.refreshOauth2Token = async () => {
         f.refreshes++;
         client.loadToken(tokens.oauth1, { ...tokens.oauth2, access_token: 'refreshed' });
@@ -84,6 +85,9 @@ test('Garmin reads pages and refuses malformed history responses', async () => {
     await paged.adapter.page(20);
     assert.equal(paged.calls[0].params.start, 20);
     assert.equal(paged.calls[0].params.limit, 10);
+    await paged.adapter.page(0, { start: start - 60000, end: start + 60000 });
+    assert.equal(paged.calls[1].params.startDate, '2025-04-05');
+    assert.equal(paged.calls[1].params.endDate, '2025-04-07');
 });
 
 test('Garmin refreshes an existing OAuth session but never falls back to SSO login', async () => {
@@ -136,6 +140,62 @@ test('Garmin adapter blocks every non-OAuth write', async () => {
     await assert.rejects(f.client.client.post('https://connectapi.garmin.cn/upload-service/upload/fit', {}), { code: 'GARMIN_READ_ONLY' });
     await assert.rejects(f.adapter.upload('/unused.fit', {}), { code: 'GARMIN_READ_ONLY' });
     assert.equal(f.calls.filter(call => call.method === 'post').length, 0);
+});
+
+test('Garmin upload adapter permits only one FIT upload and verifies through the activity inventory', async t => {
+    const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'dailysync-garmin-upload-test-'));
+    t.after(() => fs.rm(directory, { recursive: true, force: true }));
+    const file = path.join(directory, 'source.fit');
+    await fs.writeFile(file, Buffer.alloc(32), { mode: 0o600 });
+    const f = fixture(config => config.url.includes('/upload-service/upload/.fit')
+        ? { status: 200, data: { imported: true } } : undefined, undefined, true);
+    await f.adapter.connect(f.saved);
+    const transfer = { sourceId: 'c1', filename: `dailysync_${'a'.repeat(32)}.fit`,
+        evidence: { sha256: hash('fit'), start, sport: 'running', duration: 1800, distance: 5000 } };
+    assert.equal(f.adapter.supports(activity('coros-cn', 'c1')), true);
+    assert.deepEqual(await f.adapter.verify(transfer), { status: 'unknown', code: 'GARMIN_UPLOAD_NOT_VISIBLE' });
+    transfer.receipt = await f.adapter.upload(file, transfer);
+    assert.deepEqual(transfer.receipt, { status: 'accepted', stage: 'finished' });
+    assert.deepEqual(await f.adapter.verify(transfer), { status: 'accepted', stage: 'finished' });
+    const upload = f.calls.find(call => call.url.includes('/upload-service/upload/.fit'));
+    assert.equal(upload.method, 'post');
+    assert.ok(upload.data._streams.some(value => typeof value === 'string' && value.includes(transfer.filename)));
+    await assert.rejects(fs.access(path.join(directory, transfer.filename)));
+    await assert.rejects(f.client.client.post('https://connectapi.garmin.cn/activity-service/activity/1', {}),
+        { code: 'GARMIN_READ_ONLY' });
+    await assert.rejects(f.client.client.post('https://example.invalid/upload-service/upload/.fit', {}),
+        { code: 'GARMIN_READ_ONLY' });
+});
+
+test('Garmin duplicate, transient and unknown upload outcomes stay distinguishable', async t => {
+    const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'dailysync-garmin-duplicate-test-'));
+    t.after(() => fs.rm(directory, { recursive: true, force: true }));
+    const file = path.join(directory, 'source.fit');
+    await fs.writeFile(file, Buffer.alloc(32), { mode: 0o600 });
+    const duplicate = fixture(config => config.url.includes('/upload-service/upload/.fit')
+        ? { status: 409, data: 'private duplicate response' } : undefined, undefined, true);
+    await duplicate.adapter.connect(duplicate.saved);
+    const transfer = { filename: `dailysync_${'b'.repeat(32)}.fit` };
+    assert.deepEqual(await duplicate.adapter.upload(file, transfer), { status: 'duplicate', stage: 'finished' });
+
+    for (const status of [408, 425, 429]) {
+        const transient = fixture(config => config.url.includes('/upload-service/upload/.fit')
+            ? { status, data: 'private transient response' } : undefined, undefined, true);
+        await transient.adapter.connect(transient.saved);
+        assert.deepEqual(await transient.adapter.upload(file, transfer), {
+            status: 'retryable', code: status === 429 ? 'RATE_LIMIT' : 'GARMIN_UPLOAD_RETRY',
+        });
+    }
+
+    const unknown = fixture(config => {
+        if (config.url.includes('/upload-service/upload/.fit')) throw new Error('private network failure');
+    }, undefined, true);
+    await unknown.adapter.connect(unknown.saved);
+    const receipt = await unknown.adapter.upload(file, transfer);
+    assert.deepEqual(receipt, { status: 'unknown', code: 'GARMIN_UPLOAD_UNKNOWN' });
+    assert.deepEqual(await unknown.adapter.verify({ ...transfer, receipt }),
+        { status: 'pending', code: 'GARMIN_UPLOAD_UNKNOWN' });
+    assert.equal(unknown.calls.filter(call => call.url.includes('/upload-service/upload/.fit')).length, 1);
 });
 
 async function databaseFixture(t) {

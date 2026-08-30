@@ -1,4 +1,4 @@
-name: Migrate Garmin CN to COROS CN
+name: Migrate COROS CN to Garmin CN
 
 on:
   workflow_dispatch:
@@ -29,7 +29,7 @@ jobs:
           cache: pnpm
           cache-dependency-path: coros-sync/pnpm-lock.yaml
       - run: pnpm --dir coros-sync install --frozen-lockfile
-      - name: Migrate Garmin history to COROS
+      - name: Migrate COROS history to Garmin
         env:
           GARMIN_USERNAME: ${{ secrets.GARMIN_USERNAME }}
           GARMIN_MIGRATE_NUM: ${{ secrets.GARMIN_MIGRATE_NUM }}
@@ -41,5 +41,5 @@ jobs:
         shell: bash
         run: |
           migrate_start="${GARMIN_MIGRATE_START:-0}"
-          pnpm --dir coros-sync migrate_garmin_cn_to_coros \
+          pnpm --dir coros-sync migrate_coros_cn_to_garmin_cn \
             --migrate-start "$migrate_start"

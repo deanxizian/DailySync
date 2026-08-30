@@ -1,8 +1,8 @@
 {
-  "name": "dailysync-garmin-cn-to-coros",
+  "name": "dailysync-garmin-cn-coros-cn",
   "version": "1.0.0",
   "private": true,
-  "description": "Isolated Garmin CN to COROS CN migration and sync tools.",
+  "description": "Isolated bidirectional Garmin CN and COROS CN migration and sync tools.",
   "license": "GPL-3.0",
   "engines": {
     "node": ">=22.13.0"
@@ -10,7 +10,9 @@
   "packageManager": "pnpm@11.19.0",
   "scripts": {
     "migrate_garmin_cn_to_coros": "ts-node src/migrate_garmin_cn_to_coros.ts",
+    "migrate_coros_cn_to_garmin_cn": "ts-node src/migrate_coros_cn_to_garmin_cn.ts",
     "sync_garmin_cn_to_coros": "ts-node src/sync_garmin_cn_to_coros.ts",
+    "sync_coros_cn_to_garmin_cn": "ts-node src/sync_coros_cn_to_garmin_cn.ts",
     "test": "node --test tests/sync/*.test.cjs",
     "typecheck": "tsc --noEmit"
   },

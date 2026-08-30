@@ -1,12 +1,19 @@
 import { createHash } from 'crypto';
+import { constants } from 'fs';
 import fs from 'fs/promises';
 import path from 'path';
-import { Activity, ImportReceipt, PlatformAdapter, SavedSession, Transfer } from './types';
+import { Activity, ActivityWindow, ImportReceipt, PlatformAdapter, SavedSession, Transfer } from './types';
 import { finiteNumber, remoteId, sleep, SyncError } from './errors';
 import { extractSingleFit, MAX_FIT_BYTES } from './files';
 
 const { GarminConnect } = require('@gooin/garmin-connect');
 const UNUSED_PASSWORD = 'dailysync-read-only';
+const DAY_MS = 24 * 60 * 60 * 1000;
+const CHINA_OFFSET_MS = 8 * 60 * 60 * 1000;
+
+function chinaDay(timestamp: number): string {
+    return new Date(timestamp + CHINA_OFFSET_MS).toISOString().slice(0, 10);
+}
 
 export function garminLoginHash(username: string): string {
     return createHash('sha256').update(`garmin-cn:${username.trim().toLowerCase()}`).digest('hex');
@@ -53,12 +60,13 @@ function quietSync<T>(action: () => T): T {
     finally { Object.assign(console, saved); }
 }
 
-export class GarminCnReadOnlyAdapter implements PlatformAdapter {
+class GarminCnAdapter implements PlatformAdapter {
     readonly slot = 'garmin-cn' as const;
     private readonly client: any;
     private readonly loginHash: string;
 
-    constructor(private readonly username: string, client?: any, private readonly wait = sleep, private readonly pageSize = 100) {
+    constructor(private readonly username: string, client?: any, private readonly wait = sleep,
+        private readonly pageSize = 100, private readonly writable = false) {
         if (!Number.isSafeInteger(pageSize) || pageSize <= 0) throw new SyncError('CONFIG', 'Garmin page size must be a positive integer.');
         this.loginHash = garminLoginHash(username);
         // The SDK requires a non-empty constructor value even when an existing OAuth session is loaded.
@@ -73,13 +81,17 @@ export class GarminCnReadOnlyAdapter implements PlatformAdapter {
         http.interceptors.request.use(async (config: any) => {
             const method = String(config.method ?? 'get').toLowerCase();
             let oauthRefresh = false;
+            let activityUpload = false;
             try {
                 const url = new URL(String(config.url));
                 oauthRefresh = method === 'post' && url.protocol === 'https:' && url.hostname === 'connectapi.garmin.cn' &&
                     url.pathname === '/oauth-service/oauth/exchange/user/2.0' && !url.username && !url.password && !url.port;
+                activityUpload = this.writable && method === 'post' && url.protocol === 'https:' &&
+                    url.hostname === 'connectapi.garmin.cn' && url.pathname === '/upload-service/upload/.fit' &&
+                    !url.username && !url.password && !url.port;
             } catch (_) {}
-            if (!['get', 'head'].includes(method) && !oauthRefresh) {
-                throw new SyncError('GARMIN_READ_ONLY', 'The COROS bridge cannot write to Garmin or perform password login.');
+            if (!['get', 'head'].includes(method) && !oauthRefresh && !activityUpload) {
+                throw new SyncError('GARMIN_READ_ONLY', 'The COROS bridge permits only FIT activity uploads and OAuth refreshes.');
             }
             return config;
         });
@@ -134,8 +146,14 @@ export class GarminCnReadOnlyAdapter implements PlatformAdapter {
         return createHash('sha256').update(`garmin-cn:${identity}`).digest('hex');
     }
 
-    async page(cursor: number): Promise<{ activities: Activity[]; next: number | null }> {
-        const rows = await this.read<any>(() => this.client.getActivities(cursor, this.pageSize));
+    async page(cursor: number, window?: ActivityWindow): Promise<{ activities: Activity[]; next: number | null }> {
+        if (window && (!Number.isFinite(window.start) || !Number.isFinite(window.end) || window.start > window.end)) {
+            throw new SyncError('PROTOCOL', 'Garmin activity window is invalid.');
+        }
+        const startDate = window ? chinaDay(window.start - DAY_MS) : undefined;
+        const endDate = window ? chinaDay(window.end + DAY_MS) : undefined;
+        const rows = await this.read<any>(() => this.client.getActivities(cursor, this.pageSize,
+            undefined, undefined, undefined, undefined, undefined, startDate, endDate));
         if (!Array.isArray(rows)) throw new SyncError('PROTOCOL', 'Garmin activity page is not a list.');
         return { activities: rows.map(normalizeGarmin), next: rows.length ? cursor + rows.length : null };
     }
@@ -147,11 +165,60 @@ export class GarminCnReadOnlyAdapter implements PlatformAdapter {
         return extractSingleFit(archive, path.join(directory, 'original.fit'));
     }
 
-    supports(): boolean { return false; }
+    supports(): boolean { return this.writable; }
 
-    async upload(_file: string, _transfer: Transfer): Promise<ImportReceipt> {
-        throw new SyncError('GARMIN_READ_ONLY', 'The COROS bridge cannot upload to Garmin.');
+    async upload(file: string, transfer: Transfer): Promise<ImportReceipt> {
+        if (!this.writable) throw new SyncError('GARMIN_READ_ONLY', 'The COROS bridge cannot upload through a read-only Garmin adapter.');
+        if (!/^dailysync_[a-f0-9]{32}\.fit$/.test(transfer.filename)) {
+            return { status: 'failed', code: 'GARMIN_UPLOAD_FILENAME' };
+        }
+        const staged = path.join(path.dirname(file), transfer.filename);
+        try {
+            await fs.copyFile(file, staged, constants.COPYFILE_EXCL);
+            await fs.chmod(staged, 0o600);
+        } catch (_) {
+            return { status: 'failed', code: 'GARMIN_UPLOAD_PREPARE' };
+        }
+        try {
+            await quiet(() => this.client.uploadActivity(staged, 'fit'));
+            return { status: 'accepted', stage: 'finished' };
+        } catch (error) {
+            if (error instanceof SyncError) return { status: 'failed', code: error.code };
+            const status = httpStatus(error);
+            if (status === 409) return { status: 'duplicate', stage: 'finished' };
+            if (status === 401 || status === 403) return { status: 'failed', code: 'AUTH' };
+            if (status !== undefined && [408, 425, 429].includes(status)) {
+                return { status: 'retryable', code: status === 429 ? 'RATE_LIMIT' : 'GARMIN_UPLOAD_RETRY' };
+            }
+            if (status !== undefined && status >= 400 && status < 500) {
+                return { status: 'failed', code: 'GARMIN_IMPORT_REJECTED' };
+            }
+            return { status: 'unknown', code: 'GARMIN_UPLOAD_UNKNOWN' };
+        } finally {
+            await fs.rm(staged, { force: true }).catch(() => {});
+        }
     }
 
-    async verify(): Promise<ImportReceipt> { return { status: 'failed', code: 'GARMIN_READ_ONLY' }; }
+    async verify(transfer: Transfer): Promise<ImportReceipt> {
+        if (!this.writable) return { status: 'failed', code: 'GARMIN_READ_ONLY' };
+        if (!transfer.receipt) return { status: 'unknown', code: 'GARMIN_UPLOAD_NOT_VISIBLE' };
+        if (transfer.receipt.status === 'accepted') return { ...transfer.receipt, stage: 'finished' };
+        if (transfer.receipt.status === 'duplicate') return { ...transfer.receipt, stage: 'finished' };
+        if (transfer.receipt.status === 'unknown' && transfer.receipt.code === 'GARMIN_UPLOAD_UNKNOWN') {
+            return { ...transfer.receipt, status: 'pending' };
+        }
+        return { ...transfer.receipt };
+    }
+}
+
+export class GarminCnReadOnlyAdapter extends GarminCnAdapter {
+    constructor(username: string, client?: any, wait = sleep, pageSize = 100) {
+        super(username, client, wait, pageSize, false);
+    }
+}
+
+export class GarminCnUploadAdapter extends GarminCnAdapter {
+    constructor(username: string, client?: any, wait = sleep, pageSize = 100) {
+        super(username, client, wait, pageSize, true);
+    }
 }

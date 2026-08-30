@@ -2,9 +2,9 @@ require('ts-node/register/transpile-only');
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs/promises');
-const { ActivitySynchronizer, scanAll, syncExitCode, transferFor } = require('../../src/sync/engine');
+const { ActivitySynchronizer, scanAll, syncExitCode, syncOutcome, transferFor } = require('../../src/sync/engine');
 const { SyncError } = require('../../src/sync/errors');
-const { activity, evidence, FakeAdapter, harness } = require('./helpers.cjs');
+const { activity, evidence, hash, FakeAdapter, harness } = require('./helpers.cjs');
 
 test('a missing Garmin activity uploads once and is skipped on the next stateless run', async t => {
     const h = await harness(t, { 'garmin-cn': [activity('garmin-cn', 'g1')] });
@@ -14,6 +14,18 @@ test('a missing Garmin activity uploads once and is skipped on the next stateles
 
     events = await h.run();
     assert.ok(events.some(event => event.status === 'existing'));
+    assert.equal(h.target.uploads.length, 1);
+});
+
+test('a missing COROS activity uploads to Garmin and is skipped on the next stateless run', async t => {
+    const h = await harness(t, { 'coros-cn': [activity('coros-cn', 'c1')] }, 'coros-to-garmin');
+    let events = await h.run();
+    assert.deepEqual(events.map(event => [event.route, event.status]), [['coros-to-garmin', 'uploaded']]);
+    assert.equal(h.target.saved.loginHash, hash('login'));
+    assert.equal(h.target.uploads.length, 1);
+
+    events = await h.run();
+    assert.equal(events[0].status, 'existing');
     assert.equal(h.target.uploads.length, 1);
 });
 
@@ -90,15 +102,17 @@ test('bounded scans can stop after a requested range without requiring the end p
     assert.deepEqual(adapter.pages, [1]);
 });
 
-test('the import filename stays stable for one Garmin activity across FIT revisions', () => {
+test('the import filename stays stable per source platform and activity ID', () => {
     const source = activity('garmin-cn', 'g1');
     const first = transferFor(source, evidence(source));
     const second = transferFor(source, evidence(source));
     const changed = transferFor(source, evidence(source, 'edited'));
     const other = transferFor(activity('garmin-cn', 'g2'), evidence(source));
+    const reverse = transferFor(activity('coros-cn', 'g1'), evidence(source));
     assert.equal(first.filename, second.filename);
     assert.equal(first.filename, changed.filename);
     assert.notEqual(first.filename, other.filename);
+    assert.notEqual(first.filename, reverse.filename);
     assert.match(first.filename, /^dailysync_[a-f0-9]{32}\.fit$/);
 });
 
@@ -277,13 +291,22 @@ test('an unsupported activity already present in COROS is still recognized as ex
     assert.equal(h.target.uploads.length, 0);
 });
 
-test('incomplete outcomes return the attention exit code', () => {
+test('only incomplete or wholly failed runs return the attention exit code', () => {
     const base = { route: 'garmin-to-coros', source: 'garmin-cn:g1' };
     assert.equal(syncExitCode([{ ...base, status: 'existing' }]), 0);
     assert.equal(syncExitCode([{ ...base, status: 'uploaded' }]), 0);
-    for (const status of ['review', 'verifying', 'failed', 'unsupported', 'deferred']) {
-        assert.equal(syncExitCode([{ ...base, status }]), 2);
-    }
+    assert.equal(syncExitCode([{ ...base, status: 'review' }]), 0);
+    assert.equal(syncExitCode([{ ...base, status: 'unsupported' }]), 0);
+    assert.equal(syncExitCode([{ ...base, status: 'failed' }]), 2);
+    assert.equal(syncExitCode([{ ...base, status: 'failed' }, { ...base, status: 'existing' }]), 2);
+    assert.equal(syncExitCode([{ ...base, status: 'failed' }, { ...base, status: 'uploaded' }]), 0);
+    assert.equal(syncExitCode([{ ...base, status: 'verifying' }]), 2);
+    assert.equal(syncExitCode([{ ...base, status: 'deferred' }]), 2);
+    assert.equal(syncOutcome([{ ...base, status: 'existing' }]), 'success');
+    assert.equal(syncOutcome([{ ...base, status: 'unsupported' }]), 'partial');
+    assert.equal(syncOutcome([{ ...base, status: 'failed' }]), 'failed');
+    assert.equal(syncOutcome([{ ...base, status: 'failed' }, { ...base, status: 'uploaded' }]), 'partial');
+    assert.equal(syncOutcome([{ ...base, status: 'deferred' }]), 'incomplete');
 });
 
 test('scanner errors retain their sanitized code', async () => {
