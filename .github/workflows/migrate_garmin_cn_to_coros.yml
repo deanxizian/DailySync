@@ -42,5 +42,4 @@ jobs:
         run: |
           migrate_start="${GARMIN_MIGRATE_START:-0}"
           pnpm --dir coros-sync migrate_garmin_cn_to_coros \
-            --time-budget 2700 \
             --migrate-start "$migrate_start"

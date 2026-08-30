@@ -143,7 +143,7 @@ test('migration workflow uses only migration parameters', () => {
     const step = read('migrate_garmin_cn_to_coros.yml').jobs.migrate.steps
         .find(item => item.name === 'Migrate Garmin history to COROS');
     assert.deepEqual(shell(step, { GARMIN_MIGRATE_NUM: '100', GARMIN_MIGRATE_START: '21' }),
-        ['--dir', 'coros-sync', 'migrate_garmin_cn_to_coros', '--time-budget', '2700', '--migrate-start', '21']);
+        ['--dir', 'coros-sync', 'migrate_garmin_cn_to_coros', '--migrate-start', '21']);
 });
 
 test('sync workflow preserves an activity ID without shell evaluation', () => {
