@@ -7,9 +7,13 @@ on:
         description: Optional Garmin CN activity ID
         type: string
         default: ''
+  schedule:
+    # Beijing 04:00, 10:00, 16:00 and 22:00.
+    - cron: '0 2,8,14,20 * * *'
 
 concurrency:
   group: dailysync-garmin-cn-coros-cn
+  queue: max
   cancel-in-progress: false
 
 permissions:

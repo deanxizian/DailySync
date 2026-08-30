@@ -9,7 +9,6 @@ on:
       - '.github/workflows/migrate_coros_cn_to_garmin_cn.yml'
       - '.github/workflows/sync_garmin_cn_to_coros.yml'
       - '.github/workflows/sync_coros_cn_to_garmin_cn.yml'
-      - '.github/workflows/sync_garmin_cn_coros_cn.yml'
   push:
     branches:
       - main
@@ -20,7 +19,6 @@ on:
       - '.github/workflows/migrate_coros_cn_to_garmin_cn.yml'
       - '.github/workflows/sync_garmin_cn_to_coros.yml'
       - '.github/workflows/sync_coros_cn_to_garmin_cn.yml'
-      - '.github/workflows/sync_garmin_cn_coros_cn.yml'
 
 jobs:
   test:

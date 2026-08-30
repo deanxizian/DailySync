@@ -5,6 +5,7 @@ on:
 
 concurrency:
   group: dailysync-garmin-cn-coros-cn
+  queue: max
   cancel-in-progress: false
 
 permissions:
