@@ -21,7 +21,7 @@ const SPORTS: Record<number, string> = {
     800: 'climbing', 801: 'climbing', 802: 'climbing', 900: 'walking',
 };
 const IMPORT_SPORTS = new Set(['running', 'cycling', 'hiking', 'walking', 'climbing', 'swimming', 'strength', 'cardio']);
-const IMPORT_TASK_SCAN_SIZES = [10, 100, 1000];
+const IMPORT_TASK_SCAN_SIZES = [10, 100];
 const DAY_MS = 24 * 60 * 60 * 1000;
 const CHINA_OFFSET_MS = 8 * 60 * 60 * 1000;
 
@@ -320,8 +320,10 @@ export class CorosAdapter implements PlatformAdapter {
                 : task.originalFilename === transfer.filename);
             if (matches.length || !saturated) break;
         }
+        // Preflight also has the complete activity inventory and deterministic OSS key as duplicate guards.
+        // Once a submission starts, a saturated task list cannot prove its outcome.
         if (!matches.length) return { ...transfer.receipt, status: 'unknown',
-            code: saturated ? 'COROS_TASK_SCAN_INCOMPLETE' : 'COROS_TASK_NOT_VISIBLE' };
+            code: saturated && transfer.receipt ? 'COROS_TASK_SCAN_INCOMPLETE' : 'COROS_TASK_NOT_VISIBLE' };
         if (matches.length > 1) return { ...transfer.receipt, status: 'unknown', code: 'COROS_TASK_AMBIGUOUS' };
         const task = matches[0];
         const taskId = remoteId(task.id);
