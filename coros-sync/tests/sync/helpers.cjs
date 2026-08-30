@@ -4,9 +4,6 @@ const os = require('node:os');
 const path = require('node:path');
 const { createHash } = require('node:crypto');
 const { ActivitySynchronizer } = require('../../src/sync/engine');
-const { emptyState, SLOTS } = require('../../src/sync/types');
-const { validateState } = require('../../src/sync/state');
-const { validateUploadIntent } = require('../../src/sync/upload-intent');
 
 const clone = value => JSON.parse(JSON.stringify(value));
 const hash = value => createHash('sha256').update(value).digest('hex');
@@ -16,9 +13,9 @@ function activity(slot, id, offset = 0, overrides = {}) {
     return { slot, id, start: start + offset, sport: 'running', duration: 1800, distance: 5000, ...overrides };
 }
 
-function evidence(activity, tag = activity.id) {
-    return { sha256: hash(tag), device: hash(`device-${tag}`), start: activity.start, sport: activity.sport,
-        duration: activity.duration, distance: activity.distance };
+function evidence(item, tag = item.id) {
+    return { sha256: hash(tag), device: hash(`device-${tag}`), records: hash(`records-${tag}`),
+        start: item.start, sport: item.sport, duration: item.duration, distance: item.distance };
 }
 
 class FakeAdapter {
@@ -29,15 +26,12 @@ class FakeAdapter {
         this.uploads = [];
         this.pages = [];
         this.downloads = [];
+        this.tasks = new Map();
         this.identity = hash(slot);
-        this.receipt = null;
-        this.delay = false;
         this.pageSize = 2;
         this.serial = 0;
     }
     async connect() { return this.identity; }
-    session() { return undefined; }
-    setWriteGuard(guard) { this.guard = guard; }
     supports(item) { return item.sport === 'running'; }
     async page(cursor, window) {
         this.pages.push(window ? { cursor, window: clone(window) } : cursor);
@@ -55,42 +49,43 @@ class FakeAdapter {
         await fs.writeFile(file, JSON.stringify({ item, evidence: proof }), { mode: 0o600, flag: 'wx' });
         return file;
     }
-    async upload(file, task) {
-        await this.guard?.();
-        this.uploads.push(clone(task));
-        if (this.onUpload) return this.onUpload(file, task);
+    async upload(file, transfer) {
+        this.uploads.push(clone(transfer));
+        if (this.onUpload) return this.onUpload(file, transfer);
         const data = JSON.parse(await fs.readFile(file, 'utf8'));
         const id = `${this.slot}-${++this.serial}`;
         const item = { ...data.item, slot: this.slot, id };
         this.evidences.set(id, data.evidence);
-        if (this.delay) this.delayed = item;
-        else this.items.push(item);
-        return this.receipt ?? (this.slot === 'coros-cn'
-            ? { status: 'accepted', stage: 'submitted', taskId: `task-${this.serial}` }
-            : { status: 'accepted', targetId: id });
+        const taskId = `task-${this.serial}`;
+        this.tasks.set(transfer.filename, { taskId, status: this.delay ? 'pending' : 'finished', item });
+        if (!this.delay) this.items.push(item);
+        return { status: 'accepted', stage: 'submitted', taskId };
     }
-    async verify(task) {
-        if (this.onVerify) return this.onVerify(task);
-        if (this.delay) return { status: 'pending', taskId: `task-${this.serial}` };
-        if (this.delayed) { this.items.push(this.delayed); this.delayed = undefined; }
-        if (this.slot === 'coros-cn') return { status: 'accepted', stage: 'finished', taskId: `task-${this.serial}` };
-        return task.receipt ?? { status: 'unknown' };
+    async verify(transfer) {
+        if (this.onVerify) return this.onVerify(transfer);
+        const task = this.tasks.get(transfer.filename);
+        if (!task) return { status: 'unknown', code: 'COROS_TASK_NOT_VISIBLE' };
+        if (task.status === 'pending') return { status: 'pending', taskId: task.taskId };
+        if (!this.items.some(item => item.id === task.item.id)) this.items.push(task.item);
+        return { status: 'accepted', stage: 'finished', taskId: task.taskId };
+    }
+    finish(filename) {
+        const task = this.tasks.get(filename);
+        if (task) task.status = 'finished';
     }
 }
 
-async function harness(t, initial = {}, state = emptyState()) {
+async function harness(t, initial = {}) {
     const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'dailysync-test-'));
     t.after(() => fs.rm(directory, { recursive: true, force: true }));
-    const adapters = Object.fromEntries(SLOTS.map(slot => [slot, new FakeAdapter(slot, initial[slot] ?? [])]));
-    const context = { directory, state, adapters, checkpoints: [], published: [], cleared: 0, assertions: 0 };
+    const source = new FakeAdapter('garmin-cn', initial['garmin-cn'] ?? []);
+    const target = new FakeAdapter('coros-cn', initial['coros-cn'] ?? []);
+    const context = { directory, source, target, adapters: { 'garmin-cn': source, 'coros-cn': target } };
     context.run = async (options = {}, overrides = {}) => {
-        const engine = new ActivitySynchronizer({ adapters, state: context.state, directory,
+        const engine = new ActivitySynchronizer({ source, target, directory,
+            sourceSession: { loginHash: hash('login'), token: { oauth1: {}, oauth2: {} } },
             evidence: async file => JSON.parse(await fs.readFile(file, 'utf8')).evidence,
-            wait: async () => {}, assertOwned: async () => { context.assertions++; },
-            checkpoint: async value => { validateState(value); context.checkpoints.push(clone(value)); },
-            publishIntent: async value => { validateUploadIntent(value); context.published.push(clone(value)); },
-            clearIntent: async () => { context.cleared++; }, ...overrides },
-        { apply: true, pollAttempts: 1, ...options });
+            wait: async () => {}, ...overrides }, { pollAttempts: 2, ...options });
         return engine.run();
     };
     return context;

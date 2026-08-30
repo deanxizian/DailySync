@@ -46,12 +46,3 @@ export async function readGarminCnSession(root: string, username: string,
         await db?.close();
     }
 }
-
-export function newerGarminSession(saved: SavedSession | undefined, database: SavedSession): SavedSession {
-    if (!saved) return database;
-    if (saved.loginHash !== database.loginHash) throw new SyncError('ACCOUNT_CHANGED', 'Encrypted state and garmin.db belong to different Garmin usernames.');
-    if (saved.token.oauth1.oauth_token !== database.token.oauth1.oauth_token ||
-        saved.token.oauth1.oauth_token_secret !== database.token.oauth1.oauth_token_secret) return database;
-    const expiry = (session: SavedSession) => Number(session.token.oauth2.expires_at) || 0;
-    return expiry(database) > expiry(saved) ? database : saved;
-}

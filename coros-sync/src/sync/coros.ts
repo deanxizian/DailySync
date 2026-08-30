@@ -43,8 +43,15 @@ interface CorosOptions {
     username: string;
     password: string;
     http?: HttpTransport;
-    ossFactory?: (options: Record<string, any>) => { multipartUpload: (key: string, data: Buffer, options: any) => Promise<unknown> };
+    ossFactory?: (options: Record<string, any>) => {
+        put: (key: string, data: Buffer, options: any) => Promise<unknown>;
+        delete: (key: string) => Promise<unknown>;
+    };
     wait?: (milliseconds: number) => Promise<void>;
+}
+
+function objectAlreadyExists(error: any): boolean {
+    return error?.status === 409 || error?.statusCode === 409 || error?.code === 'FileAlreadyExists';
 }
 
 export function normalizeCoros(row: any): Activity {
@@ -75,7 +82,6 @@ export class CorosAdapter implements PlatformAdapter {
     private token = '';
     private userId = '';
     private relogins = 0;
-    private writeGuard: () => Promise<void> = async () => {};
     private readonly http: HttpTransport;
     private readonly wait: (milliseconds: number) => Promise<void>;
 
@@ -159,10 +165,6 @@ export class CorosAdapter implements PlatformAdapter {
         return createHash('sha256').update(`coros-cn:${this.userId}`).digest('hex');
     }
 
-    session(): undefined { return undefined; }
-
-    setWriteGuard(guard: () => Promise<void>): void { this.writeGuard = guard; }
-
     async page(cursor: number, window?: ActivityWindow): Promise<{ activities: Activity[]; next: number | null; total: number }> {
         const params: Record<string, string | number> = { modeList: '', pageNumber: cursor + 1, size: 20 };
         if (window) {
@@ -222,9 +224,13 @@ export class CorosAdapter implements PlatformAdapter {
 
     async upload(file: string, transfer: Transfer): Promise<ImportReceipt> {
         let staging!: {
-            client: { multipartUpload: (key: string, data: Buffer, options: any) => Promise<unknown> };
+            client: {
+                put: (key: string, data: Buffer, options: any) => Promise<unknown>;
+                delete: (key: string) => Promise<unknown>;
+            };
             object: string;
             packed: Buffer;
+            packedSha256: string;
             metadata: Record<string, string | number>;
         };
         try {
@@ -257,12 +263,14 @@ export class CorosAdapter implements PlatformAdapter {
             const md5 = createHash('md5').update(bytes).digest('hex');
             const object = `fit_zip/${this.userId}/${md5}.zip`;
             const zip = new JSZip();
-            zip.folder(md5)!.file(transfer.filename, bytes);
-            const packed = await zip.generateAsync({ type: 'nodebuffer', compression: 'DEFLATE' });
+            zip.file(`${md5}/${transfer.filename}`, bytes,
+                { date: new Date(Date.UTC(1980, 0, 1)), createFolders: false });
+            const packed = await zip.generateAsync({ type: 'nodebuffer', compression: 'DEFLATE', platform: 'UNIX' });
+            const packedSha256 = createHash('sha256').update(packed).digest('hex');
             const factory = this.options.ossFactory ?? (options => new OSS(options));
             const client = factory({ region: sts.Region, bucket: sts.Bucket, accessKeyId: sts.AccessKeyId,
                 accessKeySecret: sts.AccessKeySecret, stsToken: sts.SecurityToken, secure: true, timeout: 60000 });
-            staging = { client, object, packed,
+            staging = { client, object, packed, packedSha256,
                 metadata: { bucket: sts.Bucket, md5, size: bytes.length, object,
                     serviceName: 'aliyun', oriFileName: transfer.filename } };
         } catch (error) {
@@ -271,39 +279,50 @@ export class CorosAdapter implements PlatformAdapter {
             }
             return { status: 'failed', code: error instanceof SyncError && error.code === 'AUTH' ? 'AUTH' : 'COROS_STAGING_FAILED' };
         }
-        await this.writeGuard();
         try {
-            await staging.client.multipartUpload(staging.object, staging.packed, { parallel: 1, partSize: 1024 * 1024 });
+            await staging.client.put(staging.object, staging.packed, {
+                headers: { 'x-oss-forbid-overwrite': 'true' },
+                meta: { 'dailysync-sha256': staging.packedSha256, 'dailysync-filename': transfer.filename },
+            });
         } catch (error) {
-            return { status: 'retryable', code: error instanceof SyncError ? error.code : 'COROS_STAGING_RETRY' };
+            if (objectAlreadyExists(error)) {
+                return { status: 'unknown', code: 'COROS_OBJECT_EXISTS' };
+            } else {
+                return { status: 'retryable', code: error instanceof SyncError ? error.code : 'COROS_STAGING_RETRY' };
+            }
         }
         const form = new FormData();
         // Training Hub encodes timezone in quarter-hours: UTC+8 is 32, even on a UTC runner.
         form.append('jsonParameter', JSON.stringify({ source: 1, timezone: 32, ...staging.metadata }));
-        await this.writeGuard();
         try {
             const data = await this.api('/activity/fit/import', 'POST', form, undefined, false);
             return { status: 'accepted', stage: 'submitted', taskId: remoteId(data?.id) };
         } catch (error) {
-            if (error instanceof SyncError && error.code === 'RATE_LIMIT') {
-                return { status: 'retryable', code: 'RATE_LIMIT' };
+            const rejected = error instanceof SyncError && ['AUTH', 'RATE_LIMIT', 'COROS_REJECTED'].includes(error.code);
+            if (rejected) {
+                try { await staging.client.delete(staging.object); }
+                catch (_) { return { status: 'unknown', code: 'COROS_STAGING_CLEANUP_UNKNOWN' }; }
+                return { status: error.code === 'RATE_LIMIT' ? 'retryable' : 'failed', code: error.code };
             }
-            return { status: error instanceof SyncError && error.code === 'AUTH' ? 'failed' : 'unknown',
-                code: error instanceof SyncError && error.code === 'AUTH' ? 'AUTH' : 'COROS_IMPORT_UNKNOWN' };
+            return { status: 'unknown', code: 'COROS_IMPORT_UNKNOWN' };
         }
     }
 
     async verify(transfer: Transfer): Promise<ImportReceipt> {
         let matches: any[] = [];
+        let saturated = false;
         for (const size of IMPORT_TASK_SCAN_SIZES) {
             const tasks = await this.api('/activity/fit/getImportSportList', 'POST', { size });
             if (!Array.isArray(tasks) || tasks.length > size) throw new SyncError('PROTOCOL', 'COROS import task list is invalid.');
+            saturated = tasks.length === size;
             matches = tasks.filter(task => transfer.receipt?.taskId
                 ? remoteId(task.id) === transfer.receipt.taskId
                 : task.originalFilename === transfer.filename);
-            if (matches.length || tasks.length < size) break;
+            if (matches.length || !saturated) break;
         }
-        if (matches.length !== 1) return { ...transfer.receipt, status: 'unknown', code: 'COROS_TASK_NOT_VISIBLE' };
+        if (!matches.length) return { ...transfer.receipt, status: 'unknown',
+            code: saturated ? 'COROS_TASK_SCAN_INCOMPLETE' : 'COROS_TASK_NOT_VISIBLE' };
+        if (matches.length > 1) return { ...transfer.receipt, status: 'unknown', code: 'COROS_TASK_AMBIGUOUS' };
         const task = matches[0];
         const taskId = remoteId(task.id);
         if ([0, 1, 3].includes(task.status)) return { status: 'pending', taskId };

@@ -11,7 +11,7 @@ const { open } = require('sqlite');
 const CryptoJS = require('crypto-js');
 const { GarminConnect } = require('@gooin/garmin-connect');
 const { GarminCnReadOnlyAdapter, normalizeGarmin, garminLoginHash } = require('../../src/sync/garmin');
-const { readGarminCnSession, newerGarminSession } = require('../../src/sync/garmin-db');
+const { readGarminCnSession } = require('../../src/sync/garmin-db');
 const { safeError } = require('../../src/sync/errors');
 const { activity, hash, start } = require('./helpers.cjs');
 
@@ -60,7 +60,6 @@ test('Garmin adapter requires an existing database session and never calls passw
     const f = fixture();
     assert.equal(await f.adapter.connect(f.saved), hash('garmin-cn:123'));
     assert.equal(f.logins, 0);
-    assert.deepEqual(f.adapter.session(), f.saved);
     await assert.rejects(f.adapter.connect(), { code: 'GARMIN_SESSION_MISSING' });
     await assert.rejects(f.adapter.connect({ ...f.saved, loginHash: hash('another-user') }), { code: 'ACCOUNT_CHANGED' });
     assert.equal(f.logins, 0);
@@ -92,7 +91,7 @@ test('Garmin refreshes an existing OAuth session but never falls back to SSO log
     await f.adapter.connect(f.saved);
     assert.equal(f.refreshes, 1);
     assert.equal(f.logins, 0);
-    assert.equal(f.adapter.session().token.oauth2.access_token, 'refreshed');
+    assert.equal(f.client.exportToken().oauth2.access_token, 'refreshed');
 
     const rejected = fixture(() => ({ status: 401 }));
     rejected.client.client.refreshOauth2Token = async () => { rejected.refreshes++; throw { response: { status: 401 } }; };
@@ -163,16 +162,8 @@ test('garmin.db loader is read-only, username-bound and decrypts only a valid CN
     await assert.rejects(readGarminCnSession(f.root, username, 'wrong-key'), { code: 'GARMIN_DB_INVALID' });
 });
 
-test('garmin.db loader rejects missing databases and keeps the newest copied OAuth2 session', async t => {
+test('garmin.db loader rejects missing databases', async t => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), 'dailysync-garmin-db-missing-'));
     t.after(() => fs.rm(root, { recursive: true, force: true }));
     await assert.rejects(readGarminCnSession(root, username), { code: 'GARMIN_DB_MISSING' });
-    const older = { loginHash: garminLoginHash(username), token: { ...tokens, oauth2: { ...tokens.oauth2, expires_at: 1 } } };
-    const newer = { loginHash: garminLoginHash(username), token: { ...tokens, oauth2: { ...tokens.oauth2, expires_at: 2 } } };
-    assert.equal(newerGarminSession(older, newer), newer);
-    assert.equal(newerGarminSession(newer, older), newer);
-    const relogged = { loginHash: newer.loginHash, token: { ...newer.token,
-        oauth1: { oauth_token: 'replacement', oauth_token_secret: 'replacement-secret' } } };
-    assert.equal(newerGarminSession(newer, relogged), relogged);
-    assert.throws(() => newerGarminSession({ ...older, loginHash: hash('other') }, newer), { code: 'ACCOUNT_CHANGED' });
 });
