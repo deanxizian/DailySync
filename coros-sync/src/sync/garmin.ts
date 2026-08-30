@@ -4,7 +4,7 @@ import fs from 'fs/promises';
 import path from 'path';
 import { Activity, ActivityWindow, ImportReceipt, PlatformAdapter, SavedSession, Transfer } from './types';
 import { finiteNumber, remoteId, sleep, SyncError } from './errors';
-import { extractSingleFit, MAX_FIT_BYTES } from './files';
+import { extractGarminActivity, MAX_ACTIVITY_BYTES } from './files';
 
 const { GarminConnect } = require('@gooin/garmin-connect');
 const UNUSED_PASSWORD = 'dailysync-read-only';
@@ -74,8 +74,8 @@ class GarminCnAdapter implements PlatformAdapter {
         const http = this.client.client?.client;
         if (!http) return;
         http.defaults.timeout = 60000;
-        http.defaults.maxContentLength = MAX_FIT_BYTES;
-        http.defaults.maxBodyLength = MAX_FIT_BYTES;
+        http.defaults.maxContentLength = MAX_ACTIVITY_BYTES;
+        http.defaults.maxBodyLength = MAX_ACTIVITY_BYTES;
         // This owned client permits reads plus the OAuth exchange needed to keep an existing session alive.
         http.interceptors.response.eject(0);
         http.interceptors.request.use(async (config: any) => {
@@ -162,7 +162,7 @@ class GarminCnAdapter implements PlatformAdapter {
         await this.read(() => this.client.downloadOriginalActivityData({ activityId: activity.id }, directory), true);
         const archive = path.join(directory, `${activity.id}.zip`);
         await fs.chmod(archive, 0o600);
-        return extractSingleFit(archive, path.join(directory, 'original.fit'));
+        return extractGarminActivity(archive, directory, activity);
     }
 
     supports(): boolean { return this.writable; }

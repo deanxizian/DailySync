@@ -6,7 +6,7 @@ import FormData from 'form-data';
 import JSZip from 'jszip';
 import { Activity, ActivityWindow, ImportReceipt, PlatformAdapter, Transfer } from './types';
 import { finiteNumber, remoteId, sleep, SyncError } from './errors';
-import { MAX_FIT_BYTES, MIN_FIT_BYTES } from './files';
+import { MAX_ACTIVITY_BYTES, MIN_ACTIVITY_BYTES } from './files';
 
 const JSONbig = require('json-bigint')({ storeAsString: true, protoAction: 'error', constructorAction: 'error' });
 const OSS = require('ali-oss');
@@ -101,8 +101,8 @@ export class CorosAdapter implements PlatformAdapter {
         for (let attempt = 0; ; attempt++) {
             let response;
             try {
-                response = await this.http.request({ timeout: 30000, maxRedirects: 0, maxContentLength: MAX_FIT_BYTES,
-                    maxBodyLength: MAX_FIT_BYTES, validateStatus: () => true, transformResponse: [value => value], ...config });
+                response = await this.http.request({ timeout: 30000, maxRedirects: 0, maxContentLength: MAX_ACTIVITY_BYTES,
+                    maxBodyLength: MAX_ACTIVITY_BYTES, validateStatus: () => true, transformResponse: [value => value], ...config });
             } catch (_) {
                 if (retryRead && attempt < 3) { await this.wait(1000 * 2 ** attempt); continue; }
                 throw new SyncError('TRANSPORT', 'COROS request did not return a usable response.');
@@ -212,10 +212,10 @@ export class CorosAdapter implements PlatformAdapter {
         try {
             // Use a separate request without authentication headers, including on redirects.
             const response = await this.http.request({ url, method: 'GET', responseType: 'arraybuffer',
-                timeout: 60000, maxRedirects: 0, maxContentLength: MAX_FIT_BYTES, validateStatus: () => true, headers: {} });
+                timeout: 60000, maxRedirects: 0, maxContentLength: MAX_ACTIVITY_BYTES, validateStatus: () => true, headers: {} });
             if (response.status !== 200) throw new Error();
             const bytes = Buffer.from(response.data);
-            if (bytes.length > MAX_FIT_BYTES || bytes.length < MIN_FIT_BYTES) throw new Error();
+            if (bytes.length > MAX_ACTIVITY_BYTES || bytes.length < MIN_ACTIVITY_BYTES) throw new Error();
             await fs.writeFile(filename, bytes, { flag: 'wx', mode: 0o600 });
             return filename;
         } catch (_) {
@@ -237,8 +237,15 @@ export class CorosAdapter implements PlatformAdapter {
             metadata: Record<string, string | number>;
         };
         try {
+            const extension = path.extname(transfer.filename).toLowerCase();
+            if (!/^dailysync_[a-f0-9]{32}\.(?:fit|tcx)$/.test(transfer.filename) ||
+                path.extname(file).toLowerCase() !== extension) {
+                return { status: 'failed', code: 'COROS_FILE_TYPE' };
+            }
             const bytes = await fs.readFile(file);
-            if (bytes.length < MIN_FIT_BYTES || bytes.length > MAX_FIT_BYTES) return { status: 'failed', code: 'COROS_FILE_SIZE' };
+            if (bytes.length < MIN_ACTIVITY_BYTES || bytes.length > MAX_ACTIVITY_BYTES) {
+                return { status: 'failed', code: 'COROS_FILE_SIZE' };
+            }
             const sha256 = createHash('sha256').update(bytes).digest('hex');
             if (!transfer.evidence || transfer.evidence.sha256 !== sha256) {
                 return { status: 'failed', code: 'COROS_FILE_MISMATCH' };

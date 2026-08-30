@@ -39,7 +39,7 @@ async function uploadFixture(t, handler, extras = {}) {
     assert.ok(bytes.length < 20 * 1024);
     const file = path.join(directory, 'sample.fit');
     await fs.writeFile(file, bytes, { mode: 0o600 });
-    const attempt = randomUUID();
+    const attempt = randomUUID().replace(/-/g, '');
     const transfer = { sourceId: 'g1', filename: `dailysync_${attempt}.fit`,
         evidence: { sha256: createHash('sha256').update(bytes).digest('hex'), start, sport: 'running', duration: 1800, distance: 5000 } };
     const sts = { Region: 'oss-cn-shenzhen', Bucket: 'coros-test', AccessKeyId: 'test-access-key',
@@ -253,6 +253,21 @@ test('COROS stages one unchanged FIT in OSS and submits timezone 32 and original
     assert.equal(f.adapter.supports(activity('garmin-cn', 'g', 0, { sport: 'garmin-unknown' })), false);
 });
 
+test('COROS stages validated TCX with its deterministic original filename', async t => {
+    const f = await uploadFixture(t);
+    const file = path.join(f.directory, 'sample.tcx');
+    await fs.rename(f.file, file);
+    f.transfer.filename = f.transfer.filename.replace(/\.fit$/, '.tcx');
+    const receipt = await f.adapter.upload(file, f.transfer);
+    assert.equal(receipt.status, 'accepted');
+    const zip = await JSZip.loadAsync(f.staged[0].data);
+    const files = Object.values(zip.files).filter(item => !item.dir);
+    assert.equal(files.length, 1);
+    assert.equal(files[0].name.endsWith(`/${f.transfer.filename}`), true);
+    const form = f.calls.find(call => call.url.endsWith('/activity/fit/import')).data.getBuffer().toString();
+    assert.equal(form.includes(`"oriFileName":"${f.transfer.filename}"`), true);
+});
+
 test('COROS import timeout is not replayed and filename recovers the task without a response ID', async t => {
     const f = await uploadFixture(t, config => {
         if (config.url.endsWith('/activity/fit/import')) throw new Error('Test lost response with private-token');
@@ -370,6 +385,7 @@ test('COROS treats a saturated post-submission task query as incomplete', async 
 
 test('COROS failed staging or invalid files never submit an import', async t => {
     const f = await uploadFixture(t);
+    assert.equal((await f.adapter.upload(f.file, { ...f.transfer, filename: 'activity.gpx' })).code, 'COROS_FILE_TYPE');
     const small = path.join(f.directory, 'small.fit'); await fs.writeFile(small, Buffer.alloc(10));
     assert.equal((await f.adapter.upload(small, f.transfer)).code, 'COROS_FILE_SIZE');
     const changed = path.join(f.directory, 'changed.fit'); await fs.writeFile(changed, Buffer.alloc(100));

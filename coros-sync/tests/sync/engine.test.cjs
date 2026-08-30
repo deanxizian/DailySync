@@ -40,6 +40,18 @@ test('a unique summary match is treated as existing without downloading FIT file
     assert.equal(h.target.uploads.length, 0);
 });
 
+test('file evidence fills missing source summary fields for a unique existing match', async t => {
+    const source = activity('garmin-cn', 'g1', 0, { duration: null, distance: null });
+    const target = activity('coros-cn', 'c1');
+    const h = await harness(t, { 'garmin-cn': [source], 'coros-cn': [target] });
+    h.source.evidences.set(source.id, evidence({ ...source, duration: 1800, distance: 5000 }));
+    const events = await h.run();
+    assert.deepEqual(events, [{ route: 'garmin-to-coros', source: 'garmin-cn:g1', status: 'existing', targetId: 'c1' }]);
+    assert.deepEqual(h.source.downloads, ['g1']);
+    assert.deepEqual(h.target.downloads, []);
+    assert.equal(h.target.uploads.length, 0);
+});
+
 test('FIT evidence resolves duplicate-looking history and ambiguous history is not uploaded', async t => {
     const source = activity('garmin-cn', 'g1');
     const a = activity('coros-cn', 'a');
@@ -109,11 +121,13 @@ test('the import filename stays stable per source platform and activity ID', () 
     const changed = transferFor(source, evidence(source, 'edited'));
     const other = transferFor(activity('garmin-cn', 'g2'), evidence(source));
     const reverse = transferFor(activity('coros-cn', 'g1'), evidence(source));
+    const tcx = transferFor(source, evidence(source), 'tcx');
     assert.equal(first.filename, second.filename);
     assert.equal(first.filename, changed.filename);
     assert.notEqual(first.filename, other.filename);
     assert.notEqual(first.filename, reverse.filename);
     assert.match(first.filename, /^dailysync_[a-f0-9]{32}\.fit$/);
+    assert.equal(tcx.filename, first.filename.replace(/\.fit$/, '.tcx'));
 });
 
 test('a finished COROS import task is recovered without uploading again', async t => {

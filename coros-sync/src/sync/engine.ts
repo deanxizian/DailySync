@@ -2,7 +2,7 @@ import { createHash } from 'crypto';
 import fs from 'fs/promises';
 import path from 'path';
 import { Activity, ActivityWindow, activityKey, Evidence, ImportReceipt, PlatformAdapter, SavedSession, SyncRoute, Transfer } from './types';
-import { readEvidence } from './files';
+import { ActivityFileFormat, activityFileFormat, readEvidence } from './files';
 import { sleep, SyncError } from './errors';
 
 export interface SyncEvent {
@@ -148,16 +148,16 @@ export function sameRecording(a: Evidence, b: Evidence): boolean {
     return a.sha256 === b.sha256 || Boolean(a.device && a.device === b.device) || Boolean(a.records && a.records === b.records);
 }
 
-export function transferFor(source: Activity, evidence: Evidence): Transfer {
+export function transferFor(source: Activity, evidence: Evidence, format: ActivityFileFormat = 'fit'): Transfer {
     const digest = createHash('sha256')
         .update(`${source.slot}\0${source.id}`)
         .digest('hex');
-    return { sourceId: source.id, filename: `dailysync_${digest.slice(0, 32)}.fit`, evidence: { ...evidence } };
+    return { sourceId: source.id, filename: `dailysync_${digest.slice(0, 32)}.${format}`, evidence: { ...evidence } };
 }
 
 export class ActivitySynchronizer {
     readonly events: SyncEvent[] = [];
-    private readonly files = new Map<string, { file: string; evidence: Evidence }>();
+    private readonly files = new Map<string, { file: string; evidence: Evidence; format: ActivityFileFormat }>();
     private targetInventory: Activity[] = [];
     private readonly route: SyncRoute;
 
@@ -179,21 +179,27 @@ export class ActivitySynchronizer {
 
     private evidenceUnavailable(error: unknown): error is SyncError {
         return error instanceof SyncError &&
-            ['DOWNLOAD', 'FIT_INVALID', 'FIT_MISMATCH', 'GARMIN_EXPORT_UNAVAILABLE'].includes(error.code);
+            ['DOWNLOAD', 'ACTIVITY_FILE_INVALID', 'ACTIVITY_FILE_MISMATCH', 'FIT_INVALID', 'GPX_INVALID', 'GPX_UNSUPPORTED',
+                'TCX_INVALID', 'GARMIN_EXPORT_UNAVAILABLE'].includes(error.code);
     }
 
-    private async file(adapter: PlatformAdapter, activity: Activity): Promise<{ file: string; evidence: Evidence }> {
+    private async file(adapter: PlatformAdapter, activity: Activity): Promise<{
+        file: string;
+        evidence: Evidence;
+        format: ActivityFileFormat;
+    }> {
         const key = activityKey(activity.slot, activity.id);
         const cached = this.files.get(key);
         if (cached) return cached;
-        const directory = await fs.mkdtemp(path.join(this.deps.directory, 'fit-'));
+        const directory = await fs.mkdtemp(path.join(this.deps.directory, 'activity-'));
         await fs.chmod(directory, 0o700);
         const file = await adapter.download(activity, directory);
+        const format = activityFileFormat(file);
         const evidence = await (this.deps.evidence ?? readEvidence)(file);
         if (Math.abs(evidence.start - activity.start) > 60000) {
-            throw new SyncError('FIT_MISMATCH', 'Downloaded FIT does not match the activity UTC timestamp.');
+            throw new SyncError('ACTIVITY_FILE_MISMATCH', 'Downloaded activity file does not match the activity UTC timestamp.');
         }
-        const result = { file, evidence };
+        const result = { file, evidence, format };
         this.files.set(key, result);
         return result;
     }
@@ -212,6 +218,8 @@ export class ActivitySynchronizer {
 
         try {
             const proof = sourceEvidence ?? (await this.file(this.deps.source, source)).evidence;
+            const evidenceSummaryMatches = candidates.filter(candidate => comparable(proof, candidate));
+            if (evidenceSummaryMatches.length === 1) return { status: 'existing', target: evidenceSummaryMatches[0] };
             const evidenceMatches: Activity[] = [];
             for (const candidate of candidates) {
                 if (this.deadlineReached()) return { status: 'deferred', code: 'RUN_LIMIT' };
@@ -320,7 +328,7 @@ export class ActivitySynchronizer {
                 continue;
             }
 
-            let downloaded: { file: string; evidence: Evidence };
+            let downloaded: { file: string; evidence: Evidence; format: ActivityFileFormat };
             try { downloaded = await this.file(this.deps.source, source); }
             catch (error) {
                 if (!this.evidenceUnavailable(error)) throw error;
@@ -332,7 +340,7 @@ export class ActivitySynchronizer {
                 break;
             }
 
-            const transfer = transferFor(source, downloaded.evidence);
+            const transfer = transferFor(source, downloaded.evidence, downloaded.format);
             const previous = await this.deps.target.verify(transfer);
             if (!(previous.status === 'unknown' && IMPORT_NOT_VISIBLE_CODES.has(previous.code ?? ''))) {
                 const recovered = await this.reconcile(transfer, previous);

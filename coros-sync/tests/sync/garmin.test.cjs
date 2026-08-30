@@ -114,7 +114,7 @@ test('Garmin retries bounded read failures without leaking response bodies', asy
     assert.deepEqual(network.waits, [1000, 2000, 4000]);
 });
 
-test('Garmin original download stays private and requires one FIT file', async t => {
+test('Garmin preserves a private FIT original download', async t => {
     const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'dailysync-garmin-test-'));
     t.after(() => fs.rm(directory, { recursive: true, force: true }));
     const { makeFit } = await import('./fit-fixture.mjs');
