@@ -7,9 +7,13 @@ on:
         description: Optional COROS CN activity ID
         type: string
         default: ''
+  schedule:
+    # Beijing 05:00, 11:00, 17:00 and 23:00.
+    - cron: '0 3,9,15,21 * * *'
 
 concurrency:
   group: dailysync-garmin-cn-coros-cn
+  queue: max
   cancel-in-progress: false
 
 permissions:
