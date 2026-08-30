@@ -8,7 +8,7 @@ const { createHash, randomUUID } = require('node:crypto');
 const JSZip = require('jszip');
 const { CorosAdapter, normalizeCoros, validDownloadUrl } = require('../../src/sync/coros');
 const { scanAll } = require('../../src/sync/engine');
-const { SyncError, safeError } = require('../../src/sync/errors');
+const { safeError } = require('../../src/sync/errors');
 const { activity, hash, start } = require('./helpers.cjs');
 
 const success = data => ({ status: 200, data: { result: '0000', data } });
@@ -40,12 +40,11 @@ async function uploadFixture(t, handler, extras = {}) {
     const file = path.join(directory, 'sample.fit');
     await fs.writeFile(file, bytes, { mode: 0o600 });
     const attempt = randomUUID();
-    const transfer = { source: 'garmin-cn', sourceId: 'g1', target: 'coros-cn', canonical: 'group1',
-        status: 'uploading', attempt, filename: `dailysync_${attempt}.fit`, createdAt: Date.now(),
+    const transfer = { sourceId: 'g1', filename: `dailysync_${attempt}.fit`,
         evidence: { sha256: createHash('sha256').update(bytes).digest('hex'), start, sport: 'running', duration: 1800, distance: 5000 } };
     const sts = { Region: 'oss-cn-shenzhen', Bucket: 'coros-test', AccessKeyId: 'test-access-key',
         AccessKeySecret: 'test-secret', SecurityToken: 'test-sts-token' };
-    const staged = [];
+    const staged = [], removed = [];
     const f = fixture(async config => {
         const result = await handler?.(config);
         if (result) return result;
@@ -54,9 +53,12 @@ async function uploadFixture(t, handler, extras = {}) {
         if (config.url.endsWith('/activity/fit/import')) return success({ id: 'task123' });
         if (config.url.endsWith('/activity/fit/getImportSportList')) return success([{ id: 'task123', originalFilename: transfer.filename,
             status: 2, errorSize: 0, finishSize: 1 }]);
-    }, { ossFactory: options => ({ multipartUpload: async (object, data, settings) => { staged.push({ options, object, data, settings }); } }), ...extras });
+    }, { ossFactory: options => ({
+        put: async (object, data, settings) => { staged.push({ options, object, data, settings }); },
+        delete: async object => { removed.push(object); },
+    }), ...extras });
     await f.adapter.connect();
-    return { ...f, directory, file, bytes, transfer, sts, staged };
+    return { ...f, directory, file, bytes, transfer, sts, staged, removed };
 }
 
 test('COROS login uses protocol MD5, China cookies and memory-only tokens', async () => {
@@ -69,7 +71,6 @@ test('COROS login uses protocol MD5, China cookies and memory-only tokens', asyn
     assert.ok(!JSON.stringify(login).includes('private-test-password'));
     assert.equal(f.calls[1].headers.accesstoken, 'test-token-1');
     assert.equal(f.calls[1].headers.cookie, 'CPL-coros-region=2; CPL-coros-token=test-token-1');
-    assert.equal(f.adapter.session(), undefined);
 });
 
 test('COROS pagination preserves int64 IDs, UTC time and an explicit empty end page', async () => {
@@ -208,22 +209,26 @@ test('COROS per-activity export rejection is recoverable but service failures st
 
 test('COROS stages one unchanged FIT in OSS and submits timezone 32 and original-file metadata', async t => {
     const f = await uploadFixture(t);
-    let guards = 0;
-    f.adapter.setWriteGuard(async () => { guards++; });
     const receipt = await f.adapter.upload(f.file, f.transfer);
     assert.deepEqual(receipt, { status: 'accepted', stage: 'submitted', taskId: 'task123' });
     assert.equal(receipt.targetId, undefined);
-    assert.equal(guards, 2);
     const md5 = createHash('md5').update(f.bytes).digest('hex');
     const staged = f.staged[0];
     assert.equal(staged.options.secure, true);
     assert.equal(staged.options.stsToken, f.sts.SecurityToken);
     assert.equal(staged.object, `fit_zip/user1/${md5}.zip`);
+    assert.deepEqual(staged.settings.headers, { 'x-oss-forbid-overwrite': 'true' });
+    assert.deepEqual(staged.settings.meta, {
+        'dailysync-sha256': createHash('sha256').update(staged.data).digest('hex'),
+        'dailysync-filename': f.transfer.filename,
+    });
     const zip = await JSZip.loadAsync(staged.data);
     const files = Object.values(zip.files).filter(item => !item.dir);
     assert.equal(files.length, 1);
     assert.equal(files[0].name, `${md5}/${f.transfer.filename}`);
     assert.deepEqual(await files[0].async('nodebuffer'), f.bytes);
+    await f.adapter.upload(f.file, f.transfer);
+    assert.deepEqual(f.staged[1].data, staged.data);
     const form = f.calls.find(call => call.url.endsWith('/activity/fit/import')).data.getBuffer().toString();
     const metadata = JSON.parse(/name="jsonParameter"\r\n\r\n([^\r\n]+)/.exec(form)[1]);
     assert.deepEqual(metadata, { source: 1, timezone: 32, bucket: f.sts.Bucket, md5, size: f.bytes.length,
@@ -250,6 +255,7 @@ test('COROS write auth rejection stops without retrying login or import POST', a
     assert.deepEqual(await f.adapter.upload(f.file, f.transfer), { status: 'failed', code: 'AUTH' });
     assert.equal(f.calls.filter(call => call.url.endsWith('/account/login')).length, 1);
     assert.equal(f.calls.filter(call => call.url.endsWith('/activity/fit/import')).length, 1);
+    assert.deepEqual(f.removed, [f.staged[0].object]);
 });
 
 test('COROS import throttling remains retryable without replaying the write', async t => {
@@ -257,7 +263,25 @@ test('COROS import throttling remains retryable without replaying the write', as
         ? { status: 429, headers: { 'retry-after': '30' } } : undefined);
     assert.deepEqual(await f.adapter.upload(f.file, f.transfer), { status: 'retryable', code: 'RATE_LIMIT' });
     assert.equal(f.calls.filter(call => call.url.endsWith('/activity/fit/import')).length, 1);
+    assert.deepEqual(f.removed, [f.staged[0].object]);
     assert.deepEqual(f.waits, []);
+});
+
+test('COROS definitive import rejection removes the staged object', async t => {
+    const f = await uploadFixture(t, config => config.url.endsWith('/activity/fit/import')
+        ? { status: 200, data: { result: 'unsupported-import' } } : undefined);
+    assert.deepEqual(await f.adapter.upload(f.file, f.transfer), { status: 'failed', code: 'COROS_REJECTED' });
+    assert.equal(f.calls.filter(call => call.url.endsWith('/activity/fit/import')).length, 1);
+    assert.deepEqual(f.removed, [f.staged[0].object]);
+});
+
+test('COROS never retries when a rejected import cannot remove its staged object', async t => {
+    const f = await uploadFixture(t, config => config.url.endsWith('/activity/fit/import')
+        ? { status: 429, headers: { 'retry-after': '30' } } : undefined, {
+        ossFactory: () => ({ put: async () => {}, delete: async () => { throw new Error('cleanup failed'); } }),
+    });
+    assert.deepEqual(await f.adapter.upload(f.file, f.transfer),
+        { status: 'unknown', code: 'COROS_STAGING_CLEANUP_UNKNOWN' });
 });
 
 test('COROS task status distinguishes pending, finished, partial errors and missing jobs', async t => {
@@ -278,7 +302,9 @@ test('COROS task status distinguishes pending, finished, partial errors and miss
         assert.deepEqual(await f.adapter.verify(f.transfer), { status: 'accepted', stage: 'finished', taskId: 'task123' });
     }
     tasks = [];
-    assert.equal((await f.adapter.verify(f.transfer)).status, 'unknown');
+    assert.equal((await f.adapter.verify(f.transfer)).code, 'COROS_TASK_NOT_VISIBLE');
+    tasks = [{ id: 'task123', status: 2 }, { id: 'task123', status: 2 }];
+    assert.equal((await f.adapter.verify(f.transfer)).code, 'COROS_TASK_AMBIGUOUS');
     tasks = {};
     await assert.rejects(f.adapter.verify(f.transfer), { code: 'PROTOCOL' });
 });
@@ -299,21 +325,22 @@ test('COROS verification expands beyond the ten newest import tasks', async t =>
     assert.deepEqual(requested, [10, 100]);
 });
 
-test('COROS failed staging or lost lock never submits an import', async t => {
-    const f = await uploadFixture(t);
-    f.adapter.setWriteGuard(async () => { throw new SyncError('LOCK_LOST', 'Test lock loss.'); });
-    await assert.rejects(f.adapter.upload(f.file, f.transfer), { code: 'LOCK_LOST' });
-    assert.equal(f.staged.length, 0);
-    assert.equal(f.calls.some(call => call.url.endsWith('/activity/fit/import')), false);
-
-    const staged = await uploadFixture(t);
-    let guards = 0;
-    staged.adapter.setWriteGuard(async () => {
-        if (++guards === 2) throw new SyncError('LOCK_LOST', 'Test lock loss before import.');
+test('COROS treats a saturated import task query as incomplete', async t => {
+    const requested = [];
+    const f = await uploadFixture(t, config => {
+        if (!config.url.endsWith('/activity/fit/getImportSportList')) return undefined;
+        requested.push(config.data.size);
+        return success(Array.from({ length: config.data.size }, (_, index) => ({
+            id: `other-${index}`, originalFilename: `other-${index}.fit`, status: 2, errorSize: 0, finishSize: 1,
+        })));
     });
-    await assert.rejects(staged.adapter.upload(staged.file, staged.transfer), { code: 'LOCK_LOST' });
-    assert.equal(staged.staged.length, 1);
-    assert.equal(staged.calls.some(call => call.url.endsWith('/activity/fit/import')), false);
+    assert.deepEqual(await f.adapter.verify(f.transfer),
+        { status: 'unknown', code: 'COROS_TASK_SCAN_INCOMPLETE' });
+    assert.deepEqual(requested, [10, 100, 1000]);
+});
+
+test('COROS failed staging or invalid files never submit an import', async t => {
+    const f = await uploadFixture(t);
     const small = path.join(f.directory, 'small.fit'); await fs.writeFile(small, Buffer.alloc(10));
     assert.equal((await f.adapter.upload(small, f.transfer)).code, 'COROS_FILE_SIZE');
     const changed = path.join(f.directory, 'changed.fit'); await fs.writeFile(changed, Buffer.alloc(100));
@@ -339,4 +366,18 @@ test('COROS transient staging failures remain safe to retry before import submis
     assert.deepEqual(await throttled.adapter.upload(throttled.file, throttled.transfer),
         { status: 'retryable', code: 'RATE_LIMIT' });
     assert.equal(throttled.calls.some(call => call.url.endsWith('/activity/fit/import')), false);
+});
+
+test('COROS never resubmits an existing staging object', async t => {
+    const existing = await uploadFixture(t, undefined, {
+        ossFactory: () => ({
+            put: async () => {
+                throw Object.assign(new Error('Object exists'), { status: 409, code: 'FileAlreadyExists' });
+            },
+            delete: async () => {},
+        }),
+    });
+    assert.deepEqual(await existing.adapter.upload(existing.file, existing.transfer),
+        { status: 'unknown', code: 'COROS_OBJECT_EXISTS' });
+    assert.equal(existing.calls.some(call => call.url.endsWith('/activity/fit/import')), false);
 });

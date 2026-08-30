@@ -3,9 +3,12 @@ name: Migrate Garmin CN to COROS CN
 on:
   workflow_dispatch:
 
+concurrency:
+  group: dailysync-garmin-cn-to-coros
+  cancel-in-progress: false
+
 permissions:
-  actions: read
-  contents: write
+  contents: read
 
 jobs:
   migrate:
@@ -15,6 +18,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: ${{ github.ref_name }}
+          persist-credentials: false
       - uses: pnpm/action-setup@v4
         with:
           version: 11.19.0
@@ -24,11 +28,6 @@ jobs:
           node-version: '22.13.0'
           cache: pnpm
           cache-dependency-path: coros-sync/pnpm-lock.yaml
-      - name: Acquire Garmin database writer lock
-        id: garmin_db_lock
-        env:
-          GITHUB_TOKEN: ${{ github.token }}
-        run: node .github/scripts/garmin-db-lock.cjs acquire
       - run: pnpm --dir coros-sync install --frozen-lockfile
       - name: Migrate Garmin history to COROS
         env:
@@ -39,16 +38,9 @@ jobs:
           AESKEY: ${{ secrets.AESKEY }}
           COROS_USERNAME: ${{ secrets.COROS_USERNAME }}
           COROS_PASSWORD: ${{ secrets.COROS_PASSWORD }}
-          GARMIN_DB_LOCK_COMMIT: ${{ steps.garmin_db_lock.outputs.lock_commit }}
         shell: bash
         run: |
           migrate_start="${GARMIN_MIGRATE_START:-0}"
           pnpm --dir coros-sync migrate_garmin_cn_to_coros \
             --time-budget 2700 \
-            --migrate-start "$migrate_start" \
-            --apply
-      - name: Release Garmin database writer lock
-        if: ${{ always() && steps.garmin_db_lock.outputs.acquired == 'true' }}
-        env:
-          GARMIN_DB_LOCK_COMMIT: ${{ steps.garmin_db_lock.outputs.lock_commit }}
-        run: node .github/scripts/garmin-db-lock.cjs release
+            --migrate-start "$migrate_start"

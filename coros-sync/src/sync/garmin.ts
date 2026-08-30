@@ -126,15 +126,13 @@ export class GarminCnReadOnlyAdapter implements PlatformAdapter {
 
     async connect(saved?: SavedSession): Promise<string> {
         if (!this.username) throw new SyncError('CONFIG', 'GARMIN_USERNAME is required to select the CN session in garmin.db.');
-        if (!saved) throw new SyncError('GARMIN_SESSION_MISSING', 'Garmin CN session is missing from the encrypted bridge state.');
+        if (!saved) throw new SyncError('GARMIN_SESSION_MISSING', 'Garmin CN session is missing from db/garmin.db.');
         if (saved.loginHash !== this.loginHash) throw new SyncError('ACCOUNT_CHANGED', 'garmin.db session does not match GARMIN_USERNAME.');
         await this.client.loadToken(saved.token.oauth1, saved.token.oauth2);
         const profile = await this.read<any>(() => this.client.getUserProfile());
         const identity = remoteId(profile?.profileId ?? profile?.displayName);
         return createHash('sha256').update(`garmin-cn:${identity}`).digest('hex');
     }
-
-    session(): SavedSession { return { loginHash: this.loginHash, token: this.client.exportToken() }; }
 
     async page(cursor: number): Promise<{ activities: Activity[]; next: number | null }> {
         const rows = await this.read<any>(() => this.client.getActivities(cursor, this.pageSize));

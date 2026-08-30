@@ -4,29 +4,17 @@ on:
   pull_request:
     paths:
       - 'coros-sync/**'
-      - '.github/scripts/garmin-db-lock.cjs'
       - '.github/workflows/coros_sync_ci.yml'
       - '.github/workflows/migrate_garmin_cn_to_coros.yml'
-      - '.github/workflows/manage_garmin_cn_to_coros.yml'
       - '.github/workflows/sync_garmin_cn_to_coros.yml'
-      - '.github/workflows/migrate_garmin_cn_to_garmin_global.yml'
-      - '.github/workflows/migrate_garmin_global_to_garmin_cn.yml'
-      - '.github/workflows/sync_garmin_cn_to_garmin_global.yml'
-      - '.github/workflows/sync_garmin_global_to_garmin_cn.yml'
   push:
     branches:
       - main
     paths:
       - 'coros-sync/**'
-      - '.github/scripts/garmin-db-lock.cjs'
       - '.github/workflows/coros_sync_ci.yml'
       - '.github/workflows/migrate_garmin_cn_to_coros.yml'
-      - '.github/workflows/manage_garmin_cn_to_coros.yml'
       - '.github/workflows/sync_garmin_cn_to_coros.yml'
-      - '.github/workflows/migrate_garmin_cn_to_garmin_global.yml'
-      - '.github/workflows/migrate_garmin_global_to_garmin_cn.yml'
-      - '.github/workflows/sync_garmin_cn_to_garmin_global.yml'
-      - '.github/workflows/sync_garmin_global_to_garmin_cn.yml'
 
 jobs:
   test:
