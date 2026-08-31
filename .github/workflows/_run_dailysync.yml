@@ -1,0 +1,78 @@
+name: DailySync internal runner
+
+on:
+  workflow_call:
+    inputs:
+      command:
+        required: true
+        type: string
+      activity_id:
+        required: false
+        type: string
+        default: ''
+    secrets:
+      GARMIN_USERNAME:
+        required: false
+      GARMIN_PASSWORD:
+        required: false
+      GARMIN_GLOBAL_USERNAME:
+        required: false
+      GARMIN_GLOBAL_PASSWORD:
+        required: false
+      COROS_USERNAME:
+        required: false
+      COROS_PASSWORD:
+        required: false
+
+permissions:
+  contents: write
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.ref_name }}
+          fetch-depth: 0
+          persist-credentials: true
+      - uses: pnpm/action-setup@v6
+        with:
+          version: 11.19.0
+          run_install: false
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '24.20.0'
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - name: Run activity synchronization
+        id: synchronization
+        continue-on-error: true
+        env:
+          COMMAND: ${{ inputs.command }}
+          ACTIVITY_ID: ${{ inputs.activity_id }}
+          GARMIN_USERNAME: ${{ secrets.GARMIN_USERNAME }}
+          GARMIN_PASSWORD: ${{ secrets.GARMIN_PASSWORD }}
+          GARMIN_GLOBAL_USERNAME: ${{ secrets.GARMIN_GLOBAL_USERNAME }}
+          GARMIN_GLOBAL_PASSWORD: ${{ secrets.GARMIN_GLOBAL_PASSWORD }}
+          COROS_USERNAME: ${{ secrets.COROS_USERNAME }}
+          COROS_PASSWORD: ${{ secrets.COROS_PASSWORD }}
+        shell: bash
+        run: |
+          args=(--json)
+          if [[ -n "$ACTIVITY_ID" ]]; then args+=(--activity-id "$ACTIVITY_ID"); fi
+          pnpm run "$COMMAND" "${args[@]}"
+      - name: Persist changed Garmin Sessions
+        if: always() && github.ref == 'refs/heads/main'
+        env:
+          GARMIN_USERNAME: ${{ secrets.GARMIN_USERNAME }}
+          GARMIN_PASSWORD: ${{ secrets.GARMIN_PASSWORD }}
+          GARMIN_GLOBAL_USERNAME: ${{ secrets.GARMIN_GLOBAL_USERNAME }}
+          GARMIN_GLOBAL_PASSWORD: ${{ secrets.GARMIN_GLOBAL_PASSWORD }}
+        shell: bash
+        run: bash scripts/commit-garmin-session.sh
+      - name: Report synchronization failure
+        if: always() && steps.synchronization.outcome == 'failure'
+        shell: bash
+        run: exit 1
