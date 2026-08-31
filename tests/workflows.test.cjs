@@ -70,14 +70,14 @@ test('every caller supplies both Garmin credentials so Session persistence valid
     }
 });
 
-test('the reusable runner uses Node 24 Actions, Node 22, six-hour jobs and a main-only Session commit guard', async () => {
+test('the reusable runner uses Node 24 throughout, six-hour jobs and a main-only Session commit guard', async () => {
     const { source, value } = await workflow('_run_dailysync.yml');
     const job = value.jobs.run;
     assert.equal(job['timeout-minutes'], 360);
     assert.equal(value.permissions.contents, 'write');
     assert.ok(job.steps.some(step => step.uses === 'actions/checkout@v6'));
     assert.ok(job.steps.some(step => step.uses === 'pnpm/action-setup@v6'));
-    assert.equal(job.steps.find(step => step.uses === 'actions/setup-node@v6').with['node-version'], '22.13.0');
+    assert.equal(job.steps.find(step => step.uses === 'actions/setup-node@v6').with['node-version'], '24.20.0');
     assert.equal(job.steps.find(step => step.id === 'synchronization')['continue-on-error'], true);
     const persist = job.steps.find(step => step.name === 'Persist changed Garmin Sessions');
     assert.match(persist.if, /github\.ref == 'refs\/heads\/main'/);
@@ -90,6 +90,12 @@ test('the reusable runner uses Node 24 Actions, Node 22, six-hour jobs and a mai
     assert.doesNotMatch(source, /time-budget|timeout-minutes:\s*45|GARMIN_(?:SYNC|MIGRATE)_/);
     const secretNames = Object.keys(value.on.workflow_call.secrets).sort();
     assert.deepEqual(secretNames, [...SECRET_NAMES].sort());
+});
+
+test('CI runs the project on the same Node 24 release', async () => {
+    const { value } = await workflow('ci.yml');
+    const setupNode = value.jobs.test.steps.find(step => step.uses === 'actions/setup-node@v6');
+    assert.equal(setupNode.with['node-version'], '24.20.0');
 });
 
 test('daily and migration transfer limits are fixed in code at 10 and 100', async () => {

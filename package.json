@@ -5,7 +5,7 @@
   "description": "Bidirectional activity synchronization for Garmin China, Garmin Global and COROS China.",
   "license": "GPL-3.0",
   "engines": {
-    "node": ">=22.13.0"
+    "node": ">=24.20.0"
   },
   "packageManager": "pnpm@11.19.0",
   "scripts": {
@@ -37,7 +37,7 @@
     "sqlite3": "6.0.1"
   },
   "devDependencies": {
-    "@types/node": "22.19.15",
+    "@types/node": "24.13.3",
     "ts-node": "10.9.2",
     "typescript": "5.9.3",
     "yaml": "2.9.0"

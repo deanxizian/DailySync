@@ -6,7 +6,7 @@ DailySync 是一个面向个人运动数据的三平台同步工具，在佳明�
 Garmin Global <-> Garmin China <-> COROS China
 ```
 
-项目使用 TypeScript、Node.js 22 和 pnpm。日常同步由 GitHub Actions 定时执行，历史迁移通过手动 Action 分批执行。
+项目使用 TypeScript、Node.js 24 和 pnpm。日常同步由 GitHub Actions 定时执行，历史迁移通过手动 Action 分批执行。
 
 ## 同步能力
 
@@ -99,7 +99,7 @@ Session 提交不会触发同步任务，也不会覆盖远端并发更新。
 
 ## 本地运行
 
-本地环境需要 Node.js 22.13 或更高版本，以及 pnpm 11.19。
+本地环境需要 Node.js 24.20 或更高版本，以及 pnpm 11.19。
 
 ```bash
 pnpm install --frozen-lockfile

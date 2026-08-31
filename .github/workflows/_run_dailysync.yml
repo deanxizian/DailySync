@@ -43,7 +43,7 @@ jobs:
           run_install: false
       - uses: actions/setup-node@v6
         with:
-          node-version: '22.13.0'
+          node-version: '24.20.0'
           cache: pnpm
       - run: pnpm install --frozen-lockfile
       - name: Run activity synchronization
