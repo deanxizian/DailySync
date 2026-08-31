@@ -90,6 +90,13 @@ test('COROS pagination preserves int64 IDs, UTC time and an explicit empty end p
     assert.throws(() => normalizeCoros({ ...row, sportType: true }), { code: 'PROTOCOL' });
 });
 
+test('COROS summaries use active workout time and treat legacy zero values as missing', () => {
+    assert.deepEqual(normalizeCoros({ ...row, workoutTime: 1700, totalTime: 1900 }),
+        { ...activity('coros-cn', row.labelId, 0, { duration: 1700 }), sportCode: 100 });
+    assert.deepEqual(normalizeCoros({ ...row, workoutTime: 0, totalTime: 0, distance: 0 }),
+        { ...activity('coros-cn', row.labelId, 0, { duration: null, distance: null }), sportCode: 100 });
+});
+
 test('COROS full scans accept an omitted list only after the echoed last page', async () => {
     const f = fixture(config => config.url.endsWith('/activity/query')
         ? config.params.pageNumber === 1
@@ -368,7 +375,7 @@ test('COROS caps preflight task scans at the supported maximum', async t => {
     assert.deepEqual(requested, [10, 100]);
 });
 
-test('COROS treats a saturated post-submission task query as incomplete', async t => {
+test('COROS reports its bounded task history after a submitted task scrolls out', async t => {
     const requested = [];
     const f = await uploadFixture(t, config => {
         if (!config.url.endsWith('/activity/fit/getImportSportList')) return undefined;
@@ -379,7 +386,7 @@ test('COROS treats a saturated post-submission task query as incomplete', async 
     });
     f.transfer.receipt = { status: 'unknown', code: 'COROS_IMPORT_UNKNOWN' };
     assert.deepEqual(await f.adapter.verify(f.transfer),
-        { status: 'unknown', code: 'COROS_TASK_SCAN_INCOMPLETE' });
+        { status: 'unknown', code: 'COROS_TASK_HISTORY_LIMIT' });
     assert.deepEqual(requested, [10, 100]);
 });
 
@@ -472,7 +479,7 @@ test('COROS keeps an existing object when the task scan is saturated', async t =
         }),
     });
     assert.deepEqual(await saturated.adapter.upload(saturated.file, saturated.transfer),
-        { status: 'unknown', code: 'COROS_TASK_SCAN_INCOMPLETE' });
+        { status: 'unknown', code: 'COROS_TASK_HISTORY_LIMIT' });
     assert.equal(puts, 1);
     assert.equal(deletes, 0);
     assert.equal(saturated.calls.some(call => call.url.endsWith('/activity/fit/import')), false);
