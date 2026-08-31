@@ -4,43 +4,21 @@ on:
   workflow_dispatch:
 
 concurrency:
-  group: dailysync-garmin-cn-coros-cn
-  queue: max
+  group: dailysync-activity-accounts
   cancel-in-progress: false
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   migrate:
-    runs-on: ubuntu-latest
-    timeout-minutes: 360
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ github.ref_name }}
-          persist-credentials: false
-      - uses: pnpm/action-setup@v4
-        with:
-          version: 11.19.0
-          run_install: false
-      - uses: actions/setup-node@v4
-        with:
-          node-version: '22.13.0'
-          cache: pnpm
-          cache-dependency-path: coros-sync/pnpm-lock.yaml
-      - run: pnpm --dir coros-sync install --frozen-lockfile
-      - name: Migrate Garmin history to COROS
-        env:
-          GARMIN_USERNAME: ${{ secrets.GARMIN_USERNAME }}
-          GARMIN_MIGRATE_NUM: ${{ secrets.GARMIN_MIGRATE_NUM }}
-          GARMIN_MIGRATE_START: ${{ secrets.GARMIN_MIGRATE_START }}
-          GARMIN_MIGRATE_AUTO_PAGE: ${{ secrets.GARMIN_MIGRATE_AUTO_PAGE }}
-          AESKEY: ${{ secrets.AESKEY }}
-          COROS_USERNAME: ${{ secrets.COROS_USERNAME }}
-          COROS_PASSWORD: ${{ secrets.COROS_PASSWORD }}
-        shell: bash
-        run: |
-          migrate_start="${GARMIN_MIGRATE_START:-0}"
-          pnpm --dir coros-sync migrate_garmin_cn_to_coros \
-            --migrate-start "$migrate_start"
+    uses: ./.github/workflows/_run_dailysync.yml
+    with:
+      command: migrate:garmin-cn-to-coros
+    secrets:
+      GARMIN_USERNAME: ${{ secrets.GARMIN_USERNAME }}
+      GARMIN_PASSWORD: ${{ secrets.GARMIN_PASSWORD }}
+      GARMIN_GLOBAL_USERNAME: ${{ secrets.GARMIN_GLOBAL_USERNAME }}
+      GARMIN_GLOBAL_PASSWORD: ${{ secrets.GARMIN_GLOBAL_PASSWORD }}
+      COROS_USERNAME: ${{ secrets.COROS_USERNAME }}
+      COROS_PASSWORD: ${{ secrets.COROS_PASSWORD }}

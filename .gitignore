@@ -1,35 +1,16 @@
-dist
-node_modules
+/node_modules/
+/dist/
+/.local/
+
+.env
+.env.local
 *.log
-garmin_fit_files
-garmin_wellness_files
-.env
-db/*.db
-./src/constant.my.ts
-.env
-
-# Virtual environment
-bin/
-include/
-lib/
-pyvenv.cfg
-
-.cache
-*.pyc
-node_modules
-yarn-error.log
-
-/public
-# Build directory
-/build
 .DS_Store
-.sass-cache/
-_posts/
-_site/
 
-.mypy_cache
+*.fit
+*.tcx
+*.gpx
+*.zip
 
-/.vscode
-.idea
-
-config.yaml
+/db/*
+!/db/garmin.db
