@@ -1,5 +1,5 @@
-import { createHash } from 'crypto';
-import { TextDecoder } from 'util';
+import { createHash } from 'node:crypto';
+import { TextDecoder } from 'node:util';
 import { XMLBuilder, XMLParser, XMLValidator } from 'fast-xml-parser';
 import { Activity, Evidence } from '../core/types';
 import { SyncError } from '../core/errors';

@@ -1,6 +1,6 @@
-import { createHash } from 'crypto';
-import fs from 'fs/promises';
-import path from 'path';
+import { createHash } from 'node:crypto';
+import fs from 'node:fs/promises';
+import path from 'node:path';
 import { Activity, ActivityWindow, activityKey, Evidence, ImportReceipt, PlatformAdapter, SavedSession, SyncRoute, Transfer } from './types';
 import { ActivityFileFormat, activityFileFormat, readEvidence } from '../formats/files';
 import { sleep, SyncError } from './errors';
@@ -127,7 +127,7 @@ export async function scanAll(adapter: PlatformAdapter, window?: ActivityWindow)
     }
 }
 
-export function candidatesNear(source: Pick<Activity, 'start'>, target: Activity[]): Activity[] {
+function candidatesNear(source: Pick<Activity, 'start'>, target: Activity[]): Activity[] {
     return target.filter(activity => Math.abs(activity.start - source.start) <= 60000);
 }
 

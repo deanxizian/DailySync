@@ -1,5 +1,5 @@
-import fs from 'fs/promises';
-import path from 'path';
+import fs from 'node:fs/promises';
+import path from 'node:path';
 import { ActivitySynchronizer, syncExitCode, syncOutcome, SyncEvent } from '../core/engine';
 import { SyncError } from '../core/errors';
 import { PlatformAdapter, SavedSession, Slot, SyncRoute } from '../core/types';

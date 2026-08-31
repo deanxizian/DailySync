@@ -1,4 +1,4 @@
-import path from 'path';
+import path from 'node:path';
 import { safeError, SyncError } from '../core/errors';
 import { runBridge } from './bridge';
 import { loadPrivateEnvironment, parseMode, parseRoute, parseRunOptions } from './config';

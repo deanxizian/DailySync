@@ -1,7 +1,7 @@
 import axios, { AxiosRequestConfig } from 'axios';
-import { createHash } from 'crypto';
-import fs from 'fs/promises';
-import path from 'path';
+import { createHash } from 'node:crypto';
+import fs from 'node:fs/promises';
+import path from 'node:path';
 import FormData from 'form-data';
 import JSZip from 'jszip';
 import { Activity, ActivityWindow, ImportReceipt, PlatformAdapter, Transfer } from '../core/types';

@@ -101,4 +101,4 @@ function canonicalFitSport(sport, subSport) {
     return primary;
 }
 
-module.exports = { canonicalFitSport, canonicalSport, sportToken };
+module.exports = { canonicalFitSport, canonicalSport };

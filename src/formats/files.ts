@@ -1,8 +1,8 @@
-import { execFile } from 'child_process';
-import fs from 'fs';
-import path from 'path';
-import { Transform, Writable } from 'stream';
-import { pipeline } from 'stream/promises';
+import { execFile } from 'node:child_process';
+import fs from 'node:fs';
+import path from 'node:path';
+import { Transform, Writable } from 'node:stream';
+import { pipeline } from 'node:stream/promises';
 import JSZip from 'jszip';
 import { Activity, Evidence } from '../core/types';
 import { SyncError } from '../core/errors';

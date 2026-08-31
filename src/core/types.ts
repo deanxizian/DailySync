@@ -1,5 +1,4 @@
-export const SLOTS = ['garmin-cn', 'garmin-global', 'coros-cn'] as const;
-export type Slot = typeof SLOTS[number];
+export type Slot = 'garmin-cn' | 'garmin-global' | 'coros-cn';
 export type GarminSlot = Extract<Slot, `garmin-${string}`>;
 export type SyncRoute =
     | 'garmin-cn-to-garmin-global'

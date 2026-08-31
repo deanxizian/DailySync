@@ -1,7 +1,7 @@
-import { createHash } from 'crypto';
-import { constants } from 'fs';
-import fs from 'fs/promises';
-import path from 'path';
+import { createHash } from 'node:crypto';
+import { constants } from 'node:fs';
+import fs from 'node:fs/promises';
+import path from 'node:path';
 import { garminAccountHash } from '../core/account';
 import { Activity, ActivityWindow, GarminSlot, ImportReceipt, PlatformAdapter, SavedSession, Transfer } from '../core/types';
 import { finiteNumber, remoteId, sleep, SyncError } from '../core/errors';
@@ -11,7 +11,7 @@ const { GarminConnect } = require('@gooin/garmin-connect');
 const { canonicalSport } = require('../core/sports.js') as { canonicalSport: (value: unknown) => string };
 const DAY_MS = 24 * 60 * 60 * 1000;
 
-export type GarminRegion = 'CN' | 'GLOBAL';
+type GarminRegion = 'CN' | 'GLOBAL';
 
 interface GarminRegionConfig {
     slot: GarminSlot;

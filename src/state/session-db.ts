@@ -1,6 +1,6 @@
-import { createCipheriv, createDecipheriv, randomBytes, randomUUID, scryptSync } from 'crypto';
-import fs from 'fs/promises';
-import path from 'path';
+import { createCipheriv, createDecipheriv, randomBytes, randomUUID, scryptSync } from 'node:crypto';
+import fs from 'node:fs/promises';
+import path from 'node:path';
 import { open, Database } from 'sqlite';
 import sqlite3 from 'sqlite3';
 import { garminAccountHash } from '../core/account';
@@ -13,7 +13,7 @@ const SALT_BYTES = 16;
 const IV_BYTES = 12;
 const TAG_BYTES = 16;
 
-export type GarminRegion = 'CN' | 'GLOBAL';
+type GarminRegion = 'CN' | 'GLOBAL';
 
 export interface GarminCredentials {
     region: GarminRegion;

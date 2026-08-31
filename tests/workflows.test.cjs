@@ -70,12 +70,14 @@ test('every caller supplies both Garmin credentials so Session persistence valid
     }
 });
 
-test('the reusable runner uses Node 22, six-hour jobs and a main-only Session commit guard', async () => {
+test('the reusable runner uses Node 24 Actions, Node 22, six-hour jobs and a main-only Session commit guard', async () => {
     const { source, value } = await workflow('_run_dailysync.yml');
     const job = value.jobs.run;
     assert.equal(job['timeout-minutes'], 360);
     assert.equal(value.permissions.contents, 'write');
-    assert.equal(job.steps.find(step => step.uses === 'actions/setup-node@v4').with['node-version'], '22.13.0');
+    assert.ok(job.steps.some(step => step.uses === 'actions/checkout@v6'));
+    assert.ok(job.steps.some(step => step.uses === 'pnpm/action-setup@v6'));
+    assert.equal(job.steps.find(step => step.uses === 'actions/setup-node@v6').with['node-version'], '22.13.0');
     assert.equal(job.steps.find(step => step.id === 'synchronization')['continue-on-error'], true);
     const persist = job.steps.find(step => step.name === 'Persist changed Garmin Sessions');
     assert.match(persist.if, /github\.ref == 'refs\/heads\/main'/);

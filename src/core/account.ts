@@ -1,7 +1,7 @@
-import { createHash } from 'crypto';
+import { createHash } from 'node:crypto';
 import { GarminSlot } from './types';
 
-export function normalizeUsername(username: string): string {
+function normalizeUsername(username: string): string {
     return username.trim().toLowerCase();
 }
 

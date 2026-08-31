@@ -1,5 +1,5 @@
-import fs from 'fs';
-import path from 'path';
+import fs from 'node:fs';
+import path from 'node:path';
 import { parse } from 'dotenv';
 import { remoteId, SyncError } from '../core/errors';
 import { SyncRoute } from '../core/types';

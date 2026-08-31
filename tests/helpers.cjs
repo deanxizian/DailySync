@@ -106,4 +106,4 @@ async function harness(t, initial = {}, route = 'garmin-cn-to-coros-cn') {
     return context;
 }
 
-module.exports = { activity, evidence, hash, clone, FakeAdapter, harness, start };
+module.exports = { activity, evidence, hash, FakeAdapter, harness, start };

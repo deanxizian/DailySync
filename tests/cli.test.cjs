@@ -39,13 +39,12 @@ test('Session maintenance accepts one explicit region and one reset confirmation
 test('private env loading imports only the six account settings', async t => {
     const root = await directory(t);
     const lines = [...SECRET_NAMES.map((name, index) => `${name}=value-${index}`),
-        'AESKEY=legacy', 'GARMIN_SYNC_NUM=999'];
+        'UNRELATED_SETTING=ignored'];
     await fs.writeFile(path.join(root, '.env'), `${lines.join('\n')}\n`, { mode: 0o600 });
     const env = {};
     loadPrivateEnvironment(root, env);
     assert.deepEqual(Object.keys(env), [...SECRET_NAMES]);
-    assert.equal(env.AESKEY, undefined);
-    assert.equal(env.GARMIN_SYNC_NUM, undefined);
+    assert.equal(env.UNRELATED_SETTING, undefined);
 });
 
 test('credential files with broad permissions are rejected', async t => {

@@ -1,4 +1,4 @@
-import path from 'path';
+import path from 'node:path';
 import { safeError, SyncError } from '../core/errors';
 import { GarminAdapter } from '../platforms/garmin';
 import { checkGarminSessionDatabase, GarminCredentials, rekeyGarminSession,

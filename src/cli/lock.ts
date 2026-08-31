@@ -1,5 +1,5 @@
-import fs from 'fs/promises';
-import path from 'path';
+import fs from 'node:fs/promises';
+import path from 'node:path';
 import { SyncError } from '../core/errors';
 
 export async function withRunLock<T>(root: string, action: () => Promise<T>): Promise<T> {
