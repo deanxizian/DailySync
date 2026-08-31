@@ -8,46 +8,25 @@ on:
         type: string
         default: ''
   schedule:
-    # Beijing 04:00, 10:00, 16:00 and 22:00.
     - cron: '0 2,8,14,20 * * *'
 
 concurrency:
-  group: dailysync-garmin-cn-coros-cn
-  queue: max
+  group: dailysync-activity-accounts
   cancel-in-progress: false
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   sync:
-    runs-on: ubuntu-latest
-    timeout-minutes: 360
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ github.ref_name }}
-          persist-credentials: false
-      - uses: pnpm/action-setup@v4
-        with:
-          version: 11.19.0
-          run_install: false
-      - uses: actions/setup-node@v4
-        with:
-          node-version: '22.13.0'
-          cache: pnpm
-          cache-dependency-path: coros-sync/pnpm-lock.yaml
-      - run: pnpm --dir coros-sync install --frozen-lockfile
-      - name: Sync Garmin activities to COROS
-        env:
-          GARMIN_USERNAME: ${{ secrets.GARMIN_USERNAME }}
-          GARMIN_SYNC_NUM: ${{ secrets.GARMIN_SYNC_NUM }}
-          AESKEY: ${{ secrets.AESKEY }}
-          COROS_USERNAME: ${{ secrets.COROS_USERNAME }}
-          COROS_PASSWORD: ${{ secrets.COROS_PASSWORD }}
-          SYNC_ACTIVITY_ID: ${{ inputs.activity_id }}
-        shell: bash
-        run: |
-          args=(--time-budget 2700)
-          if [[ -n "$SYNC_ACTIVITY_ID" ]]; then args+=(--activity-id "$SYNC_ACTIVITY_ID"); fi
-          pnpm --dir coros-sync sync_garmin_cn_to_coros "${args[@]}"
+    uses: ./.github/workflows/_run_dailysync.yml
+    with:
+      command: sync:garmin-cn-to-coros
+      activity_id: ${{ inputs.activity_id || '' }}
+    secrets:
+      GARMIN_USERNAME: ${{ secrets.GARMIN_USERNAME }}
+      GARMIN_PASSWORD: ${{ secrets.GARMIN_PASSWORD }}
+      GARMIN_GLOBAL_USERNAME: ${{ secrets.GARMIN_GLOBAL_USERNAME }}
+      GARMIN_GLOBAL_PASSWORD: ${{ secrets.GARMIN_GLOBAL_PASSWORD }}
+      COROS_USERNAME: ${{ secrets.COROS_USERNAME }}
+      COROS_PASSWORD: ${{ secrets.COROS_PASSWORD }}
