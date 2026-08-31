@@ -1,0 +1,30 @@
+name: Sync Garmin Global to Garmin CN
+
+on:
+  workflow_dispatch:
+    inputs:
+      activity_id:
+        description: Optional Garmin Global activity ID
+        type: string
+        default: ''
+  schedule:
+    - cron: '0 1,7,13,19 * * *'
+
+concurrency:
+  group: dailysync-activity-accounts
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    uses: ./.github/workflows/_run_dailysync.yml
+    with:
+      command: sync:garmin-global-to-cn
+      activity_id: ${{ inputs.activity_id || '' }}
+    secrets:
+      GARMIN_USERNAME: ${{ secrets.GARMIN_USERNAME }}
+      GARMIN_PASSWORD: ${{ secrets.GARMIN_PASSWORD }}
+      GARMIN_GLOBAL_USERNAME: ${{ secrets.GARMIN_GLOBAL_USERNAME }}
+      GARMIN_GLOBAL_PASSWORD: ${{ secrets.GARMIN_GLOBAL_PASSWORD }}
