@@ -24,8 +24,10 @@ export function syncOutcome(events: SyncEvent[]): SyncOutcome {
     return events.some(event => ['review', 'unsupported'].includes(event.status)) ? 'partial' : 'success';
 }
 
-export function syncExitCode(events: SyncEvent[]): number {
-    return syncOutcome(events) === 'success' ? 0 : 2;
+export function syncExitCode(_events: SyncEvent[]): number {
+    // Item-level outcomes are reported as warnings. Errors that make the run itself
+    // unreliable (authentication, incomplete scans, state failures, etc.) throw.
+    return 0;
 }
 
 export interface SyncOptions {
@@ -59,7 +61,25 @@ interface ReconcileResult {
     candidates?: string[];
 }
 
-const TERMINAL_IMPORT_CODES = new Set(['COROS_IMPORT_ERRORS', 'COROS_TASK_FAILED', 'COROS_TASK_UNRECOGNIZED']);
+interface DownloadedActivity {
+    file: string;
+    evidence: Evidence;
+    format: ActivityFileFormat;
+    summaryMatches: boolean;
+}
+
+const TERMINAL_IMPORT_CODES = new Set(['COROS_IMPORT_ERRORS', 'COROS_TASK_FAILED']);
+const SYSTEMIC_IMPORT_CODES = new Set([
+    'AUTH',
+    'COROS_FILE_MISMATCH',
+    'COROS_FILE_SIZE',
+    'COROS_FILE_TYPE',
+    'COROS_STAGING_FAILED',
+    'COROS_TASK_UNRECOGNIZED',
+    'GARMIN_UPLOAD_FILENAME',
+    'GARMIN_UPLOAD_PREPARE',
+    'GARMIN_WRITE_BLOCKED',
+]);
 const IMPORT_NOT_VISIBLE_CODES = new Set(['COROS_TASK_NOT_VISIBLE', 'GARMIN_UPLOAD_NOT_VISIBLE']);
 
 export async function scanAll(adapter: PlatformAdapter, window?: ActivityWindow): Promise<Activity[]> {
@@ -136,15 +156,14 @@ function comparable(a: { start: number; sport: string; duration: number | null; 
 
 function couldBeSameActivity(a: { start: number; sport: string; duration: number | null; distance: number | null },
     b: { start: number; sport: string; duration: number | null; distance: number | null }): boolean {
-    if (Math.abs(a.start - b.start) > 60000 || a.sport !== b.sport) return false;
-    if (a.duration !== null && b.duration !== null &&
-        Math.abs(a.duration - b.duration) > Math.max(60, Math.max(a.duration, b.duration) * 0.1)) return false;
-    return a.distance === null || b.distance === null ||
-        Math.abs(a.distance - b.distance) <= Math.max(500, Math.max(a.distance, b.distance) * 0.1);
+    // Duration and distance can be edited independently on either platform while
+    // the original recording remains unchanged. Keep same-time/same-sport rows as
+    // candidates and let file evidence prove whether they are the same recording.
+    return Math.abs(a.start - b.start) <= 60000 && a.sport === b.sport;
 }
 
 function evidenceMatchesActivity(activity: Activity, evidence: Evidence): boolean {
-    if (Math.abs(evidence.start - activity.start) > 60000 || evidence.sport !== activity.sport) return false;
+    if (!evidenceIdentityMatches(activity, evidence)) return false;
     if (activity.duration !== null && (evidence.duration === null ||
         Math.abs(evidence.duration - activity.duration) > Math.max(5, Math.max(evidence.duration, activity.duration) * 0.01))) {
         return false;
@@ -153,9 +172,27 @@ function evidenceMatchesActivity(activity: Activity, evidence: Evidence): boolea
         Math.abs(evidence.distance - activity.distance) <= Math.max(20, Math.max(evidence.distance, activity.distance) * 0.01));
 }
 
+function evidenceIdentityMatches(activity: Activity, evidence: Evidence): boolean {
+    return Math.abs(evidence.start - activity.start) <= 60000 && evidence.sport === activity.sport;
+}
+
 export function sameRecording(a: Evidence, b: Evidence): boolean {
-    if (!comparable(a, b)) return false;
-    return a.sha256 === b.sha256 || Boolean(a.device && a.device === b.device) || Boolean(a.records && a.records === b.records);
+    return compareRecording(a, b) === 'same';
+}
+
+type RecordingComparison = 'same' | 'different' | 'incomparable';
+
+function compareRecording(a: Evidence, b: Evidence): RecordingComparison {
+    if (Math.abs(a.start - b.start) > 2000 || a.sport !== b.sport) return 'different';
+    if (a.sha256 === b.sha256 || Boolean(a.device && a.device === b.device) ||
+        Boolean(a.records && a.records === b.records)) return 'same';
+    if (a.duration === null || b.duration === null || a.distance === null || b.distance === null) {
+        return 'incomparable';
+    }
+    if (!comparable(a, b)) return 'different';
+    // Distinct decoded track fingerprints can rule out another recording. Raw
+    // byte hashes cannot: platforms may reserialize either FIT or TCX exports.
+    return a.records && b.records ? 'different' : 'incomparable';
 }
 
 export function transferFor(source: Activity, evidence: Evidence, format: ActivityFileFormat = 'fit'): Transfer {
@@ -168,7 +205,7 @@ export function transferFor(source: Activity, evidence: Evidence, format: Activi
 export class ActivitySynchronizer {
     readonly events: SyncEvent[] = [];
     transferLimitReached = false;
-    private readonly files = new Map<string, { file: string; evidence: Evidence; format: ActivityFileFormat }>();
+    private readonly files = new Map<string, DownloadedActivity>();
     private targetInventory: Activity[] = [];
     private readonly route: SyncRoute;
 
@@ -198,11 +235,7 @@ export class ActivitySynchronizer {
                 'TCX_INVALID', 'GARMIN_EXPORT_UNAVAILABLE'].includes(error.code);
     }
 
-    private async file(adapter: PlatformAdapter, activity: Activity): Promise<{
-        file: string;
-        evidence: Evidence;
-        format: ActivityFileFormat;
-    }> {
+    private async file(adapter: PlatformAdapter, activity: Activity): Promise<DownloadedActivity> {
         const key = activityKey(activity.slot, activity.id);
         const cached = this.files.get(key);
         if (cached) return cached;
@@ -211,11 +244,11 @@ export class ActivitySynchronizer {
         const file = await adapter.download(activity, directory);
         const format = activityFileFormat(file);
         const evidence = await (this.deps.evidence ?? readEvidence)(file, activity);
-        if (!evidenceMatchesActivity(activity, evidence)) {
+        if (!evidenceIdentityMatches(activity, evidence)) {
             throw new SyncError('ACTIVITY_FILE_MISMATCH',
-                'Downloaded activity file does not match the activity time, sport, duration or distance.');
+                'Downloaded activity file does not match the activity start time or sport.');
         }
-        const result = { file, evidence, format };
+        const result = { file, evidence, format, summaryMatches: evidenceMatchesActivity(activity, evidence) };
         this.files.set(key, result);
         return result;
     }
@@ -226,25 +259,43 @@ export class ActivitySynchronizer {
         this.targetInventory = [...inventory.values()].sort((a, b) => a.start - b.start || a.id.localeCompare(b.id));
     }
 
-    private async classify(source: Activity, candidates: Activity[], sourceEvidence?: Evidence): Promise<CandidateResult> {
+    private async classify(source: Activity, candidates: Activity[], sourceFile?: DownloadedActivity): Promise<CandidateResult> {
         const plausible = candidates.filter(candidate => couldBeSameActivity(source, candidate));
         if (!plausible.length) return { status: 'absent' };
         const summaryMatches = plausible.filter(candidate => comparable(source, candidate));
-        if (summaryMatches.length === 1) return { status: 'existing', target: summaryMatches[0] };
-
-        try {
-            const proof = sourceEvidence ?? (await this.file(this.deps.source, source)).evidence;
-            const evidenceSummaryMatches = plausible.filter(candidate => comparable(proof, candidate));
-            if (evidenceSummaryMatches.length === 1) return { status: 'existing', target: evidenceSummaryMatches[0] };
-            const evidenceMatches: Activity[] = [];
-            for (const candidate of plausible) {
-                const targetEvidence = (await this.file(this.deps.target, candidate)).evidence;
-                if (sameRecording(proof, targetEvidence)) evidenceMatches.push(candidate);
-            }
-            if (evidenceMatches.length === 1) return { status: 'existing', target: evidenceMatches[0] };
-        } catch (error) {
-            if (!this.evidenceUnavailable(error)) throw error;
+        if (plausible.length === 1 && summaryMatches.length === 1) {
+            return { status: 'existing', target: summaryMatches[0] };
         }
+
+        let downloaded: DownloadedActivity;
+        try {
+            downloaded = sourceFile ?? await this.file(this.deps.source, source);
+        }
+        catch (error) {
+            if (!this.evidenceUnavailable(error)) throw error;
+            return { status: 'review', code: 'AMBIGUOUS_HISTORY', candidates: plausible.map(candidate => candidate.id) };
+        }
+        const evidenceSummaryMatches = plausible.filter(candidate => comparable(downloaded.evidence, candidate));
+        if (plausible.length === 1 && downloaded.summaryMatches && evidenceSummaryMatches.length === 1) {
+            return { status: 'existing', target: evidenceSummaryMatches[0] };
+        }
+        const evidenceMatches: Activity[] = [];
+        let inconclusiveEvidence = false;
+        for (const candidate of plausible) {
+            try {
+                const targetFile = await this.file(this.deps.target, candidate);
+                const comparison = compareRecording(downloaded.evidence, targetFile.evidence);
+                if (comparison === 'same') evidenceMatches.push(candidate);
+                else if (comparison === 'incomparable') inconclusiveEvidence = true;
+            } catch (error) {
+                if (!this.evidenceUnavailable(error)) throw error;
+                inconclusiveEvidence = true;
+            }
+        }
+        if (evidenceMatches.length === 1 && !inconclusiveEvidence) {
+            return { status: 'existing', target: evidenceMatches[0] };
+        }
+        if (!evidenceMatches.length && !inconclusiveEvidence) return { status: 'absent' };
         return { status: 'review', code: 'AMBIGUOUS_HISTORY', candidates: plausible.map(candidate => candidate.id) };
     }
 
@@ -260,42 +311,64 @@ export class ActivitySynchronizer {
         return transfer.receipt;
     }
 
+    private throwIfSystemicImportFailure(code?: string): void {
+        if (code && SYSTEMIC_IMPORT_CODES.has(code)) {
+            throw new SyncError(code, 'The target import service or local transfer invariant failed.');
+        }
+    }
+
     private async reconcile(transfer: Transfer, initial?: ImportReceipt): Promise<ReconcileResult> {
-        if (initial) this.mergeReceipt(transfer, initial);
+        let receipt: ImportReceipt | undefined;
+        if (initial) {
+            receipt = this.mergeReceipt(transfer, initial);
+            this.throwIfSystemicImportFailure(initial.code);
+        }
         const rounds = this.options.pollAttempts ?? 6;
         for (let round = 0; round < rounds; round++) {
-            const receipt = this.mergeReceipt(transfer, await this.deps.target.verify(transfer));
-            if (receipt.status === 'failed') return { status: 'failed', code: receipt.code ?? 'COROS_IMPORT_FAILED' };
+            receipt ??= this.mergeReceipt(transfer, await this.deps.target.verify(transfer));
+            this.throwIfSystemicImportFailure(receipt.code);
             if (receipt.status === 'retryable') return { status: 'deferred', code: receipt.code ?? 'COROS_IMPORT_RETRY' };
-            if (receipt.status !== 'pending') {
-                const candidates = await this.scopedTargets(transfer.evidence);
-                const plausible = candidates.filter(candidate => couldBeSameActivity(transfer.evidence, candidate));
-                const summaryMatches = plausible.filter(candidate => comparable(transfer.evidence, candidate));
-                if (summaryMatches.length === 1) return { status: 'complete', target: summaryMatches[0] };
-                const evidenceMatches: Activity[] = [];
-                let evidenceUnavailable = false;
-                for (const candidate of plausible) {
-                    try {
-                        if (sameRecording(transfer.evidence, (await this.file(this.deps.target, candidate)).evidence)) {
-                            evidenceMatches.push(candidate);
-                        }
-                    } catch (error) {
-                        if (!this.evidenceUnavailable(error)) throw error;
-                        evidenceUnavailable = true;
-                    }
-                }
-                if (evidenceMatches.length === 1 && !evidenceUnavailable) {
-                    return { status: 'complete', target: evidenceMatches[0] };
-                }
-                if (summaryMatches.length > 1 || evidenceMatches.length > 1) {
-                    const ambiguous = evidenceMatches.length > 1 ? evidenceMatches : summaryMatches;
-                    return { status: 'verifying', code: 'MULTIPLE_TARGETS', candidates: ambiguous.map(item => item.id) };
-                }
-                if (receipt.status === 'unknown' && receipt.code && !IMPORT_NOT_VISIBLE_CODES.has(receipt.code)) {
-                    return { status: TERMINAL_IMPORT_CODES.has(receipt.code) ? 'failed' : 'verifying', code: receipt.code };
+            // The activity inventory is authoritative. COROS keeps only a bounded
+            // import-task history, and a task can still say pending after the
+            // activity has become visible.
+            const candidates = await this.scopedTargets(transfer.evidence);
+            const plausible = candidates.filter(candidate => couldBeSameActivity(transfer.evidence, candidate));
+            const summaryMatches = plausible.filter(candidate => comparable(transfer.evidence, candidate));
+            if (plausible.length === 1 && summaryMatches.length === 1) {
+                return { status: 'complete', target: summaryMatches[0] };
+            }
+            const evidenceMatches: Activity[] = [];
+            let inconclusiveEvidence = false;
+            for (const candidate of plausible) {
+                try {
+                    const comparison = compareRecording(transfer.evidence,
+                        (await this.file(this.deps.target, candidate)).evidence);
+                    if (comparison === 'same') evidenceMatches.push(candidate);
+                    else if (comparison === 'incomparable') inconclusiveEvidence = true;
+                } catch (error) {
+                    if (!this.evidenceUnavailable(error)) throw error;
+                    inconclusiveEvidence = true;
                 }
             }
-            if (round + 1 < rounds) await (this.deps.wait ?? sleep)(5000);
+            if (evidenceMatches.length === 1 && !inconclusiveEvidence) {
+                return { status: 'complete', target: evidenceMatches[0] };
+            }
+            if ((summaryMatches.length > 1 && inconclusiveEvidence) || evidenceMatches.length > 1 ||
+                (evidenceMatches.length === 1 && inconclusiveEvidence)) {
+                const ambiguous = evidenceMatches.length > 1 && !inconclusiveEvidence ? evidenceMatches : plausible;
+                return { status: 'verifying', code: 'MULTIPLE_TARGETS', candidates: ambiguous.map(item => item.id) };
+            }
+            if (receipt.status === 'failed') {
+                return { status: 'failed', code: receipt.code ?? 'COROS_IMPORT_FAILED' };
+            }
+            if (receipt.status === 'unknown' && receipt.code && !IMPORT_NOT_VISIBLE_CODES.has(receipt.code)) {
+                if (TERMINAL_IMPORT_CODES.has(receipt.code)) return { status: 'failed', code: receipt.code };
+                return { status: 'verifying', code: receipt.code };
+            }
+            if (round + 1 < rounds) {
+                await (this.deps.wait ?? sleep)(5000);
+                receipt = undefined;
+            }
         }
         return { status: 'verifying', code: transfer.receipt?.code ?? 'IMPORT_PENDING' };
     }
@@ -326,6 +399,7 @@ export class ActivitySynchronizer {
         }
 
         let transfers = 0;
+        const unresolvedEvidence: Evidence[] = [];
         for (const source of orderedSources) {
             if (this.options.activityId && source.id !== this.options.activityId) continue;
             const existing = await this.classify(source, candidatesNearSorted(source, this.targetInventory));
@@ -344,11 +418,19 @@ export class ActivitySynchronizer {
                 break;
             }
 
-            let downloaded: { file: string; evidence: Evidence; format: ActivityFileFormat };
+            let downloaded: DownloadedActivity;
             try { downloaded = await this.file(this.deps.source, source); }
             catch (error) {
                 if (!this.evidenceUnavailable(error)) throw error;
                 this.event(source, 'review', { code: error.code });
+                continue;
+            }
+            if (!downloaded.summaryMatches) {
+                this.event(source, 'review', { code: 'ACTIVITY_FILE_MISMATCH' });
+                continue;
+            }
+            if (unresolvedEvidence.some(evidence => compareRecording(evidence, downloaded.evidence) !== 'different')) {
+                this.event(source, 'verifying', { code: 'RELATED_UNRESOLVED_IMPORT' });
                 continue;
             }
             const transfer = transferFor(source, downloaded.evidence, downloaded.format);
@@ -356,12 +438,13 @@ export class ActivitySynchronizer {
             if (!(previous.status === 'unknown' && IMPORT_NOT_VISIBLE_CODES.has(previous.code ?? ''))) {
                 const recovered = await this.reconcile(transfer, previous);
                 this.emitReconcile(source, recovered, 'existing');
-                if (recovered.status === 'verifying' || recovered.status === 'deferred') break;
+                if (recovered.status === 'verifying') unresolvedEvidence.push(downloaded.evidence);
+                if (recovered.status === 'deferred') break;
                 continue;
             }
 
             const freshTargets = await this.scopedTargets(downloaded.evidence);
-            const fresh = await this.classify(source, freshTargets, downloaded.evidence);
+            const fresh = await this.classify(source, freshTargets, downloaded);
             if (fresh.status !== 'absent') {
                 this.emitCandidate(source, fresh);
                 if (fresh.status === 'deferred') break;
@@ -373,8 +456,8 @@ export class ActivitySynchronizer {
             catch (_) { receipt = { status: 'unknown', code: 'UPLOAD_OUTCOME_UNKNOWN' }; }
             this.mergeReceipt(transfer, receipt);
             if (receipt.status === 'failed') {
+                this.throwIfSystemicImportFailure(receipt.code);
                 this.event(source, 'failed', { code: receipt.code });
-                if (receipt.code === 'AUTH') throw new SyncError('AUTH', 'Target authentication failed; uploads stopped.');
                 continue;
             }
             if (receipt.status === 'retryable') {
@@ -383,7 +466,8 @@ export class ActivitySynchronizer {
             }
             const imported = await this.reconcile(transfer);
             this.emitReconcile(source, imported, 'uploaded');
-            if (imported.status === 'verifying' || imported.status === 'deferred') break;
+            if (imported.status === 'verifying') unresolvedEvidence.push(downloaded.evidence);
+            if (imported.status === 'deferred') break;
         }
         return this.events;
     }

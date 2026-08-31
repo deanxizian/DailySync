@@ -52,7 +52,7 @@ test('file evidence fills missing source summary fields for a unique existing ma
     assert.equal(h.target.uploads.length, 0);
 });
 
-test('FIT evidence resolves duplicate-looking history and ambiguous history is not uploaded', async t => {
+test('FIT evidence resolves duplicate-looking history and complete nonmatches allow upload', async t => {
     const source = activity('garmin-cn', 'g1');
     const a = activity('coros-cn', 'a');
     const b = activity('coros-cn', 'b');
@@ -65,9 +65,39 @@ test('FIT evidence resolves duplicate-looking history and ambiguous history is n
 
     const ambiguous = await harness(t, { 'garmin-cn': [source], 'coros-cn': [a, b] });
     events = await ambiguous.run();
+    assert.equal(events[0].status, 'uploaded');
+    assert.equal(ambiguous.target.uploads.length, 1);
+});
+
+test('unavailable candidate evidence keeps duplicate-looking history in review', async t => {
+    const source = activity('garmin-cn', 'g1');
+    const a = activity('coros-cn', 'a');
+    const b = activity('coros-cn', 'b');
+    const h = await harness(t, { 'garmin-cn': [source], 'coros-cn': [a, b] });
+    h.target.onDownload = async item => {
+        if (item.id === 'b') throw new SyncError('DOWNLOAD', 'Original recording is unavailable.');
+    };
+
+    const events = await h.run();
     assert.equal(events[0].status, 'review');
     assert.deepEqual(events[0].candidates, ['a', 'b']);
-    assert.equal(ambiguous.target.uploads.length, 0);
+    assert.equal(h.target.uploads.length, 0);
+});
+
+test('one evidence match plus an unavailable candidate remains ambiguous', async t => {
+    const source = activity('garmin-cn', 'g1');
+    const a = activity('coros-cn', 'a');
+    const b = activity('coros-cn', 'b');
+    const h = await harness(t, { 'garmin-cn': [source], 'coros-cn': [a, b] });
+    h.target.evidences.set(a.id, evidence(source));
+    h.target.onDownload = async item => {
+        if (item.id === b.id) throw new SyncError('DOWNLOAD', 'Original recording is unavailable.');
+    };
+
+    const events = await h.run();
+    assert.deepEqual(events.map(event => [event.status, event.code]), [['review', 'AMBIGUOUS_HISTORY']]);
+    assert.deepEqual(events[0].candidates, ['a', 'b']);
+    assert.equal(h.target.uploads.length, 0);
 });
 
 test('an unrelated nearby activity does not make a missing activity ambiguous', async t => {
@@ -78,6 +108,112 @@ test('an unrelated nearby activity does not make a missing activity ambiguous', 
     assert.equal(events[0].status, 'uploaded');
     assert.equal(h.target.uploads.length, 1);
     assert.deepEqual(h.target.downloads, []);
+});
+
+test('complete file evidence rules out a different same-sport activity in the same minute', async t => {
+    const source = activity('garmin-cn', 'source', 0, { duration: 1800, distance: 5000 });
+    const nearby = activity('coros-cn', 'nearby', 30000, { duration: 7200, distance: 21000 });
+    const h = await harness(t, { 'garmin-cn': [source], 'coros-cn': [nearby] });
+
+    const events = await h.run();
+    assert.equal(events[0].status, 'uploaded');
+    assert.equal(h.target.uploads.length, 1);
+});
+
+test('cross-format evidence without a shared fingerprint remains in review', async t => {
+    const path = require('node:path');
+    const source = activity('garmin-cn', 'source', 0, { duration: 1800, distance: 5000 });
+    const target = activity('coros-cn', 'target', 0, { duration: 2000, distance: 5500 });
+    const h = await harness(t, { 'garmin-cn': [source], 'coros-cn': [target] });
+    h.source.evidences.set(source.id, { sha256: hash('source-tcx'), start: source.start,
+        sport: source.sport, duration: source.duration, distance: source.distance });
+    h.target.evidences.set(target.id, { sha256: hash('target-fit'), start: source.start,
+        sport: source.sport, duration: source.duration, distance: source.distance });
+    h.source.download = async (item, directory) => {
+        h.source.downloads.push(item.id);
+        const file = path.join(directory, 'original.tcx');
+        await fs.writeFile(file, JSON.stringify({ item, evidence: h.source.evidences.get(item.id) }),
+            { mode: 0o600, flag: 'wx' });
+        return file;
+    };
+
+    const events = await h.run();
+    assert.deepEqual(events.map(event => [event.status, event.code]), [['review', 'AMBIGUOUS_HISTORY']]);
+    assert.equal(h.target.uploads.length, 0);
+});
+
+test('incompatible decoded cross-format evidence rules out a nearby activity', async t => {
+    const path = require('node:path');
+    const source = activity('garmin-cn', 'source', 0, { duration: 1800, distance: 5000 });
+    const target = activity('coros-cn', 'target', 30000, { duration: 7200, distance: 21000 });
+    const h = await harness(t, { 'garmin-cn': [source], 'coros-cn': [target] });
+    h.source.evidences.set(source.id, { sha256: hash('source-tcx'), start: source.start,
+        sport: source.sport, duration: source.duration, distance: source.distance });
+    h.target.evidences.set(target.id, { sha256: hash('target-fit'), start: target.start,
+        sport: target.sport, duration: target.duration, distance: target.distance });
+    h.source.download = async (item, directory) => {
+        h.source.downloads.push(item.id);
+        const file = path.join(directory, 'original.tcx');
+        await fs.writeFile(file, JSON.stringify({ item, evidence: h.source.evidences.get(item.id) }),
+            { mode: 0o600, flag: 'wx' });
+        return file;
+    };
+
+    const events = await h.run();
+    assert.equal(events[0].status, 'uploaded');
+    assert.equal(h.target.uploads.length, 1);
+});
+
+test('unequal same-format bytes without track fingerprints remain in review', async t => {
+    const path = require('node:path');
+    const source = activity('garmin-cn', 'source');
+    const target = activity('coros-cn', 'target', 0, { duration: 2000, distance: 5500 });
+    const h = await harness(t, { 'garmin-cn': [source], 'coros-cn': [target] });
+    h.source.evidences.set(source.id, { sha256: hash('source-tcx'), start: source.start,
+        sport: source.sport, duration: source.duration, distance: source.distance });
+    h.target.evidences.set(target.id, { sha256: hash('reserialized-tcx'), start: source.start,
+        sport: source.sport, duration: source.duration, distance: source.distance });
+    for (const adapter of [h.source, h.target]) {
+        adapter.download = async (item, directory) => {
+            adapter.downloads.push(item.id);
+            const file = path.join(directory, 'original.tcx');
+            await fs.writeFile(file, JSON.stringify({ item, evidence: adapter.evidences.get(item.id) }),
+                { mode: 0o600, flag: 'wx' });
+            return file;
+        };
+    }
+
+    const events = await h.run();
+    assert.deepEqual(events.map(event => [event.status, event.code]), [['review', 'AMBIGUOUS_HISTORY']]);
+    assert.equal(h.target.uploads.length, 0);
+});
+
+test('a shared file fingerprint resolves an existing activity with missing summaries', async t => {
+    const source = activity('garmin-cn', 'source', 0, { duration: null, distance: null });
+    const target = activity('coros-cn', 'target', 0, { duration: null, distance: null });
+    const h = await harness(t, { 'garmin-cn': [source], 'coros-cn': [target] });
+    const shared = { sha256: hash('shared-file'), start: source.start, sport: source.sport,
+        duration: null, distance: null };
+    h.source.evidences.set(source.id, shared);
+    h.target.evidences.set(target.id, { ...shared });
+
+    const events = await h.run();
+    assert.deepEqual(events.map(event => [event.status, event.targetId]), [['existing', 'target']]);
+    assert.equal(h.target.uploads.length, 0);
+});
+
+test('missing file summaries and unequal serialization remain in review', async t => {
+    const source = activity('garmin-cn', 'source', 0, { duration: null, distance: null });
+    const target = activity('coros-cn', 'target', 0, { duration: null, distance: null });
+    const h = await harness(t, { 'garmin-cn': [source], 'coros-cn': [target] });
+    h.source.evidences.set(source.id, { sha256: hash('source-file'), start: source.start,
+        sport: source.sport, duration: null, distance: null });
+    h.target.evidences.set(target.id, { sha256: hash('target-file'), start: target.start,
+        sport: target.sport, duration: null, distance: null });
+
+    const events = await h.run();
+    assert.deepEqual(events.map(event => [event.status, event.code]), [['review', 'AMBIGUOUS_HISTORY']]);
+    assert.equal(h.target.uploads.length, 0);
 });
 
 test('a transfer limit counts actual missing uploads and repeated full scans continue the migration', async t => {
@@ -157,15 +293,32 @@ test('a finished COROS import task is recovered without uploading again', async 
     assert.equal(h.target.uploads.length, 0);
 });
 
-test('a pending prior import blocks the batch instead of being uploaded twice', async t => {
+test('a pending prior import is not replayed and does not block unrelated activities', async t => {
     const source = activity('garmin-cn', 'g1');
     const h = await harness(t, { 'garmin-cn': [source, activity('garmin-cn', 'g2', -86400000)] });
     const transfer = transferFor(source, evidence(source));
     h.target.tasks.set(transfer.filename, { taskId: 'pending-task', status: 'pending', item: activity('coros-cn', 'pending') });
 
     const events = await h.run();
-    assert.equal(events.length, 1);
+    assert.equal(events.length, 2);
     assert.equal(events[0].status, 'verifying');
+    assert.equal(events[1].status, 'uploaded');
+    assert.equal(h.target.uploads.length, 1);
+});
+
+test('the target activity inventory wins when an import task still reports pending', async t => {
+    const source = activity('garmin-cn', 'g1');
+    const target = activity('coros-cn', 'visible');
+    const h = await harness(t, { 'garmin-cn': [source] });
+    h.target.evidences.set(target.id, evidence(source));
+    h.target.onVerify = async () => {
+        if (!h.target.items.some(item => item.id === target.id)) h.target.items.push(target);
+        return { status: 'pending', taskId: 'pending-task' };
+    };
+
+    const events = await h.run();
+    assert.deepEqual(events, [{ route: 'garmin-cn-to-coros-cn', source: 'garmin-cn:g1',
+        status: 'existing', targetId: 'visible' }]);
     assert.equal(h.target.uploads.length, 0);
 });
 
@@ -180,14 +333,19 @@ test('ambiguous prior COROS tasks block replay instead of starting another uploa
     assert.equal(h.target.uploads.length, 0);
 });
 
-test('an incomplete COROS task scan blocks replay instead of starting another upload', async t => {
+test('a bounded COROS task history blocks replay of that activity without failing the run', async t => {
     const source = activity('garmin-cn', 'g1');
     const h = await harness(t, { 'garmin-cn': [source] });
-    h.target.onVerify = async () => ({ status: 'unknown', code: 'COROS_TASK_SCAN_INCOMPLETE' });
+    let checks = 0;
+    h.target.onVerify = async () => {
+        checks++;
+        return { status: 'unknown', code: 'COROS_TASK_HISTORY_LIMIT' };
+    };
 
     const events = await h.run();
     assert.equal(events[0].status, 'verifying');
-    assert.equal(events[0].code, 'COROS_TASK_SCAN_INCOMPLETE');
+    assert.equal(events[0].code, 'COROS_TASK_HISTORY_LIMIT');
+    assert.equal(checks, 1);
     assert.equal(h.target.uploads.length, 0);
 });
 
@@ -252,15 +410,112 @@ test('post-import duplicate summaries are resolved with FIT evidence', async t =
     assert.equal(h.target.uploads.length, 1);
 });
 
-test('an unknown upload outcome stops later uploads until a future scan can resolve it', async t => {
+test('post-import matching evidence stays unresolved when another candidate cannot be checked', async t => {
+    const source = activity('garmin-cn', 'g1');
+    const h = await harness(t, { 'garmin-cn': [source] });
+    h.target.onUpload = async (file, transfer) => {
+        const data = JSON.parse(await fs.readFile(file, 'utf8'));
+        const imported = { ...data.item, slot: 'coros-cn', id: 'imported' };
+        const unavailable = activity('coros-cn', 'unavailable');
+        h.target.items.push(imported, unavailable);
+        h.target.evidences.set(imported.id, data.evidence);
+        h.target.onDownload = async item => {
+            if (item.id === unavailable.id) throw new SyncError('DOWNLOAD', 'Original recording is unavailable.');
+        };
+        h.target.tasks.set(transfer.filename, { taskId: 'task-imported', status: 'finished', item: imported });
+        return { status: 'accepted', stage: 'submitted', taskId: 'task-imported' };
+    };
+
+    const events = await h.run();
+    assert.deepEqual(events.map(event => [event.status, event.code]), [['verifying', 'MULTIPLE_TARGETS']]);
+    assert.deepEqual(events[0].candidates, ['imported', 'unavailable']);
+    assert.equal(h.target.uploads.length, 1);
+});
+
+test('pending import keeps polling after file evidence rules out summary decoys', async t => {
+    const source = activity('garmin-cn', 'g1');
+    const h = await harness(t, { 'garmin-cn': [source] });
+    let imported;
+    let verification = 0;
+    h.target.onUpload = async file => {
+        const data = JSON.parse(await fs.readFile(file, 'utf8'));
+        imported = { ...data.item, slot: 'coros-cn', id: 'imported' };
+        h.target.evidences.set(imported.id, data.evidence);
+        h.target.items.push(activity('coros-cn', 'decoy-a'), activity('coros-cn', 'decoy-b'));
+        return { status: 'accepted', stage: 'submitted', taskId: 'task-imported' };
+    };
+    h.target.onVerify = async transfer => {
+        if (!transfer.receipt) return { status: 'unknown', code: 'COROS_TASK_NOT_VISIBLE' };
+        if (++verification === 1) return { status: 'pending', taskId: 'task-imported' };
+        h.target.items.push(imported);
+        return { status: 'accepted', stage: 'finished', taskId: 'task-imported' };
+    };
+
+    const events = await h.run();
+    assert.deepEqual(events.map(event => [event.status, event.targetId]), [['uploaded', 'imported']]);
+    assert.equal(verification, 2);
+    assert.equal(h.target.uploads.length, 1);
+});
+
+test('an unknown upload outcome warns but does not block unrelated activities', async t => {
     const h = await harness(t, { 'garmin-cn': [
         activity('garmin-cn', 'new', 86400000), activity('garmin-cn', 'old'),
     ] });
     h.target.onUpload = async () => ({ status: 'unknown', code: 'COROS_IMPORT_UNKNOWN' });
     const events = await h.run();
-    assert.equal(events.length, 1);
-    assert.equal(events[0].status, 'verifying');
+    assert.deepEqual(events.map(event => event.status), ['verifying', 'verifying']);
+    assert.equal(h.target.uploads.length, 2);
+});
+
+test('an unknown upload outcome quarantines another source ID for the same recording', async t => {
+    const first = activity('garmin-cn', 'a');
+    const duplicate = activity('garmin-cn', 'b');
+    const h = await harness(t, { 'garmin-cn': [first, duplicate] });
+    h.source.evidences.set(first.id, evidence(first, 'same-recording'));
+    h.source.evidences.set(duplicate.id, evidence(duplicate, 'same-recording'));
+    h.target.onUpload = async () => ({ status: 'unknown', code: 'COROS_IMPORT_UNKNOWN' });
+
+    const events = await h.run();
+    assert.deepEqual(events.map(event => [event.source, event.status, event.code]), [
+        ['garmin-cn:a', 'verifying', 'COROS_TASK_NOT_VISIBLE'],
+        ['garmin-cn:b', 'verifying', 'RELATED_UNRESOLVED_IMPORT'],
+    ]);
     assert.equal(h.target.uploads.length, 1);
+});
+
+test('an unknown upload outcome quarantines an inconclusive reserialization', async t => {
+    const first = activity('garmin-cn', 'a');
+    const duplicate = activity('garmin-cn', 'b');
+    const h = await harness(t, { 'garmin-cn': [first, duplicate] });
+    h.source.evidences.set(first.id, { ...evidence(first, 'first-format'), device: undefined, records: undefined });
+    h.source.evidences.set(duplicate.id, { ...evidence(duplicate, 'second-format'), device: undefined, records: undefined });
+    h.target.onUpload = async () => ({ status: 'unknown', code: 'COROS_IMPORT_UNKNOWN' });
+
+    const events = await h.run();
+    assert.deepEqual(events.map(event => [event.source, event.status, event.code]), [
+        ['garmin-cn:a', 'verifying', 'COROS_TASK_NOT_VISIBLE'],
+        ['garmin-cn:b', 'verifying', 'RELATED_UNRESOLVED_IMPORT'],
+    ]);
+    assert.equal(h.target.uploads.length, 1);
+});
+
+test('a recovered pending import quarantines another source ID for the same recording', async t => {
+    const first = activity('garmin-cn', 'a');
+    const duplicate = activity('garmin-cn', 'b');
+    const h = await harness(t, { 'garmin-cn': [first, duplicate] });
+    const shared = evidence(first, 'same-recording');
+    h.source.evidences.set(first.id, shared);
+    h.source.evidences.set(duplicate.id, { ...shared });
+    const transfer = transferFor(first, shared);
+    h.target.tasks.set(transfer.filename, { taskId: 'pending-task', status: 'pending',
+        item: activity('coros-cn', 'pending') });
+
+    const events = await h.run();
+    assert.deepEqual(events.map(event => [event.source, event.status, event.code]), [
+        ['garmin-cn:a', 'verifying', 'IMPORT_PENDING'],
+        ['garmin-cn:b', 'verifying', 'RELATED_UNRESOLVED_IMPORT'],
+    ]);
+    assert.equal(h.target.uploads.length, 0);
 });
 
 test('a pending asynchronous import is recovered on the next stateless run', async t => {
@@ -284,6 +539,38 @@ test('retryable upload failures and rate limits stop the current batch', async t
     const events = await h.run();
     assert.deepEqual(events.map(event => [event.status, event.code]), [['deferred', 'RATE_LIMIT']]);
     assert.equal(h.target.uploads.length, 1);
+});
+
+test('systemic import protocol failures still fail the whole run', async t => {
+    const h = await harness(t, { 'garmin-cn': [activity('garmin-cn', 'g1')] });
+    h.target.onUpload = async () => ({ status: 'failed', code: 'COROS_STAGING_FAILED' });
+    await assert.rejects(h.run(), { code: 'COROS_STAGING_FAILED' });
+});
+
+test('a visible target cannot hide a systemic import-task protocol failure', async t => {
+    const source = activity('garmin-cn', 'g1');
+    const target = activity('coros-cn', 'visible');
+    const h = await harness(t, { 'garmin-cn': [source] });
+    h.target.evidences.set(target.id, evidence(source));
+    h.target.onVerify = async () => {
+        if (!h.target.items.some(item => item.id === target.id)) h.target.items.push(target);
+        return { status: 'unknown', code: 'COROS_TASK_UNRECOGNIZED' };
+    };
+    await assert.rejects(h.run(), { code: 'COROS_TASK_UNRECOGNIZED' });
+    assert.equal(h.target.uploads.length, 0);
+});
+
+test('an initial systemic import receipt is checked before another verification request', async t => {
+    const source = activity('garmin-cn', 'g1');
+    const h = await harness(t, { 'garmin-cn': [source] });
+    let checks = 0;
+    h.target.onVerify = async () => ++checks === 1
+        ? { status: 'unknown', code: 'COROS_TASK_UNRECOGNIZED' }
+        : { status: 'unknown', code: 'COROS_TASK_NOT_VISIBLE' };
+
+    await assert.rejects(h.run(), { code: 'COROS_TASK_UNRECOGNIZED' });
+    assert.equal(checks, 1);
+    assert.equal(h.target.uploads.length, 0);
 });
 
 test('a target appearing after the initial scan is found before upload', async t => {
@@ -328,6 +615,50 @@ test('a downloaded recording with a mismatched summary is never uploaded', async
     assert.equal(h.target.uploads.length, 0);
 });
 
+test('an immutable source export mismatch is never used as duplicate evidence', async t => {
+    const source = activity('garmin-cn', 'source');
+    const target = activity('coros-cn', 'target', 0, { duration: 7200, distance: 21000 });
+    const h = await harness(t, { 'garmin-cn': [source], 'coros-cn': [target] });
+    const wrong = evidence({ ...source, sport: 'cycling' }, 'wrong-recording');
+    h.source.evidences.set(source.id, wrong);
+    h.target.evidences.set(target.id, wrong);
+
+    const events = await h.run();
+    assert.deepEqual(events.map(event => [event.status, event.code]), [['review', 'AMBIGUOUS_HISTORY']]);
+    assert.deepEqual(h.source.downloads, ['source']);
+    assert.deepEqual(h.target.downloads, []);
+    assert.equal(h.target.uploads.length, 0);
+});
+
+test('identical original recordings resolve activities whose platform summaries were edited', async t => {
+    const source = activity('garmin-global', 'global', 0, { duration: 810.691, distance: 2196.43 });
+    const target = activity('garmin-cn', 'cn', 0, { duration: 702, distance: 2174.88 });
+    const h = await harness(t, { 'garmin-global': [source], 'garmin-cn': [target] }, 'garmin-global-to-garmin-cn');
+    const original = evidence(source, 'same-original');
+    h.source.evidences.set(source.id, original);
+    h.target.evidences.set(target.id, original);
+
+    const events = await h.run();
+    assert.deepEqual(events, [{ route: 'garmin-global-to-garmin-cn', source: 'garmin-global:global',
+        status: 'existing', targetId: 'cn' }]);
+    assert.deepEqual(h.source.downloads, ['global']);
+    assert.deepEqual(h.target.downloads, ['cn']);
+    assert.equal(h.target.uploads.length, 0);
+});
+
+test('an edited source summary cannot accept an unrelated target by summary alone', async t => {
+    const source = activity('garmin-cn', 'source', 0, { duration: 3600, distance: 10000 });
+    const target = activity('coros-cn', 'target', 0, { duration: 1800, distance: 5000 });
+    const h = await harness(t, { 'garmin-cn': [source], 'coros-cn': [target] });
+    h.source.evidences.set(source.id, evidence(target, 'source-file'));
+    h.target.evidences.set(target.id, evidence(target, 'target-file'));
+
+    const events = await h.run();
+    assert.deepEqual(events.map(event => [event.status, event.code]), [['review', 'ACTIVITY_FILE_MISMATCH']]);
+    assert.deepEqual(h.target.downloads, ['target']);
+    assert.equal(h.target.uploads.length, 0);
+});
+
 test('an unsupported activity already present in COROS is still recognized as existing', async t => {
     const source = activity('garmin-cn', 'g1', 0, { sport: 'rowing' });
     const target = activity('coros-cn', 'c1', 0, { sport: 'rowing' });
@@ -337,17 +668,17 @@ test('an unsupported activity already present in COROS is still recognized as ex
     assert.equal(h.target.uploads.length, 0);
 });
 
-test('any unresolved activity returns the attention exit code', () => {
+test('item-level attention remains visible without failing an otherwise complete run', () => {
     const base = { route: 'garmin-cn-to-coros-cn', source: 'garmin-cn:g1' };
     assert.equal(syncExitCode([{ ...base, status: 'existing' }]), 0);
     assert.equal(syncExitCode([{ ...base, status: 'uploaded' }]), 0);
-    assert.equal(syncExitCode([{ ...base, status: 'review' }]), 2);
-    assert.equal(syncExitCode([{ ...base, status: 'unsupported' }]), 2);
-    assert.equal(syncExitCode([{ ...base, status: 'failed' }]), 2);
-    assert.equal(syncExitCode([{ ...base, status: 'failed' }, { ...base, status: 'existing' }]), 2);
-    assert.equal(syncExitCode([{ ...base, status: 'failed' }, { ...base, status: 'uploaded' }]), 2);
-    assert.equal(syncExitCode([{ ...base, status: 'verifying' }]), 2);
-    assert.equal(syncExitCode([{ ...base, status: 'deferred' }]), 2);
+    assert.equal(syncExitCode([{ ...base, status: 'review' }]), 0);
+    assert.equal(syncExitCode([{ ...base, status: 'unsupported' }]), 0);
+    assert.equal(syncExitCode([{ ...base, status: 'failed' }]), 0);
+    assert.equal(syncExitCode([{ ...base, status: 'failed' }, { ...base, status: 'existing' }]), 0);
+    assert.equal(syncExitCode([{ ...base, status: 'failed' }, { ...base, status: 'uploaded' }]), 0);
+    assert.equal(syncExitCode([{ ...base, status: 'verifying' }]), 0);
+    assert.equal(syncExitCode([{ ...base, status: 'deferred' }]), 0);
     assert.equal(syncOutcome([{ ...base, status: 'existing' }]), 'success');
     assert.equal(syncOutcome([{ ...base, status: 'unsupported' }]), 'partial');
     assert.equal(syncOutcome([{ ...base, status: 'failed' }]), 'failed');

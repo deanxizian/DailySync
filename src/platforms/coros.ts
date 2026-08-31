@@ -58,6 +58,11 @@ function objectAlreadyExists(error: any): boolean {
     return error?.status === 409 || error?.statusCode === 409 || error?.code === 'FileAlreadyExists';
 }
 
+function positiveNumber(value: unknown): number | null {
+    const number = finiteNumber(value);
+    return number !== null && number > 0 ? number : null;
+}
+
 export function normalizeCoros(row: any): Activity {
     const start = finiteNumber(row?.startTime);
     const sportCode = finiteNumber(row?.sportType);
@@ -66,7 +71,10 @@ export function normalizeCoros(row: any): Activity {
     }
     return { slot: 'coros-cn', id: remoteId(row.labelId), start: start * 1000,
         sport: SPORTS[sportCode] ?? `coros-${sportCode}`, sportCode,
-        duration: finiteNumber(row.totalTime), distance: finiteNumber(row.distance) };
+        // workoutTime matches the FIT timer duration; totalTime includes pauses.
+        // Older imported rows use zero to mean that a summary field is unavailable.
+        duration: positiveNumber(row.workoutTime) ?? positiveNumber(row.totalTime),
+        distance: positiveNumber(row.distance) };
 }
 
 export function validDownloadUrl(value: unknown): string {
@@ -368,7 +376,7 @@ export class CorosAdapter implements PlatformAdapter {
         // Preflight also has the complete activity inventory and deterministic OSS key as duplicate guards.
         // Once a submission starts, a saturated task list cannot prove its outcome.
         if (!matches.length) return { ...transfer.receipt, status: 'unknown',
-            code: saturated && transfer.receipt ? 'COROS_TASK_SCAN_INCOMPLETE' : 'COROS_TASK_NOT_VISIBLE' };
+            code: saturated && transfer.receipt ? 'COROS_TASK_HISTORY_LIMIT' : 'COROS_TASK_NOT_VISIBLE' };
         if (matches.length > 1) return { ...transfer.receipt, status: 'unknown', code: 'COROS_TASK_AMBIGUOUS' };
         const task = matches[0];
         const taskId = remoteId(task.id);
