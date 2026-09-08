@@ -1,0 +1,25 @@
+name: Migrate Garmin CN to Garmin Global
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: dailysync-activity-accounts
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  migrate:
+    uses: ./.github/workflows/_run_dailysync.yml
+    with:
+      command: migrate:garmin-cn-to-global
+    secrets:
+      GARMIN_USERNAME: ${{ secrets.GARMIN_USERNAME }}
+      GARMIN_PASSWORD: ${{ secrets.GARMIN_PASSWORD }}
+      GARMIN_GLOBAL_USERNAME: ${{ secrets.GARMIN_GLOBAL_USERNAME }}
+      GARMIN_GLOBAL_PASSWORD: ${{ secrets.GARMIN_GLOBAL_PASSWORD }}
+      GARMIN_OAUTH1: ${{ secrets.GARMIN_OAUTH1 }}
+      GARMIN_GLOBAL_OAUTH1: ${{ secrets.GARMIN_GLOBAL_OAUTH1 }}
+      GH_SECRETS_TOKEN: ${{ secrets.GH_SECRETS_TOKEN }}

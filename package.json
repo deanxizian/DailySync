@@ -1,0 +1,42 @@
+{
+  "name": "dailysync",
+  "version": "2.0.0",
+  "private": true,
+  "description": "Bidirectional activity synchronization for Garmin China, Garmin Global and COROS China.",
+  "license": "GPL-3.0",
+  "engines": {
+    "node": ">=24.20.0"
+  },
+  "packageManager": "pnpm@11.19.0",
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "node --test tests/*.test.cjs",
+    "sync:garmin-cn-to-global": "ts-node src/cli/run.ts sync garmin-cn-to-garmin-global",
+    "sync:garmin-global-to-cn": "ts-node src/cli/run.ts sync garmin-global-to-garmin-cn",
+    "sync:garmin-cn-to-coros": "ts-node src/cli/run.ts sync garmin-cn-to-coros-cn",
+    "sync:coros-to-garmin-cn": "ts-node src/cli/run.ts sync coros-cn-to-garmin-cn",
+    "migrate:garmin-cn-to-global": "ts-node src/cli/run.ts migration garmin-cn-to-garmin-global",
+    "migrate:garmin-global-to-cn": "ts-node src/cli/run.ts migration garmin-global-to-garmin-cn",
+    "migrate:garmin-cn-to-coros": "ts-node src/cli/run.ts migration garmin-cn-to-coros-cn",
+    "migrate:coros-to-garmin-cn": "ts-node src/cli/run.ts migration coros-cn-to-garmin-cn",
+    "session:check": "ts-node src/cli/session-maintenance.ts check",
+    "session:login": "ts-node src/cli/session-maintenance.ts login"
+  },
+  "dependencies": {
+    "@garmin/fitsdk": "21.214.0",
+    "@gooin/garmin-connect": "1.8.7",
+    "ali-oss": "6.23.0",
+    "axios": "1.20.0",
+    "dotenv": "17.4.2",
+    "fast-xml-parser": "5.11.1",
+    "form-data": "4.0.6",
+    "json-bigint": "1.0.0",
+    "jszip": "3.10.1"
+  },
+  "devDependencies": {
+    "@types/node": "24.13.3",
+    "ts-node": "10.9.2",
+    "typescript": "5.9.3",
+    "yaml": "2.9.0"
+  }
+}

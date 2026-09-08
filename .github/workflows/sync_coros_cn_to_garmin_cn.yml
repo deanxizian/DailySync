@@ -1,0 +1,32 @@
+name: Sync COROS CN to Garmin CN
+
+on:
+  workflow_dispatch:
+    inputs:
+      activity_id:
+        description: Optional COROS CN activity ID
+        type: string
+        default: ''
+  schedule:
+    - cron: '0 3,9,15,21 * * *'
+
+concurrency:
+  group: dailysync-activity-accounts
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  sync:
+    uses: ./.github/workflows/_run_dailysync.yml
+    with:
+      command: sync:coros-to-garmin-cn
+      activity_id: ${{ inputs.activity_id || '' }}
+    secrets:
+      GARMIN_USERNAME: ${{ secrets.GARMIN_USERNAME }}
+      GARMIN_PASSWORD: ${{ secrets.GARMIN_PASSWORD }}
+      GARMIN_OAUTH1: ${{ secrets.GARMIN_OAUTH1 }}
+      GH_SECRETS_TOKEN: ${{ secrets.GH_SECRETS_TOKEN }}
+      COROS_USERNAME: ${{ secrets.COROS_USERNAME }}
+      COROS_PASSWORD: ${{ secrets.COROS_PASSWORD }}

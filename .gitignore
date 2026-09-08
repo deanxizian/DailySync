@@ -1,0 +1,15 @@
+/node_modules/
+/dist/
+/.local/
+
+.env
+.env.local
+*.log
+.DS_Store
+
+*.fit
+*.tcx
+*.gpx
+*.zip
+
+*.db

@@ -1,0 +1,24 @@
+name: Migrate COROS CN to Garmin CN
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: dailysync-activity-accounts
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  migrate:
+    uses: ./.github/workflows/_run_dailysync.yml
+    with:
+      command: migrate:coros-to-garmin-cn
+    secrets:
+      GARMIN_USERNAME: ${{ secrets.GARMIN_USERNAME }}
+      GARMIN_PASSWORD: ${{ secrets.GARMIN_PASSWORD }}
+      GARMIN_OAUTH1: ${{ secrets.GARMIN_OAUTH1 }}
+      GH_SECRETS_TOKEN: ${{ secrets.GH_SECRETS_TOKEN }}
+      COROS_USERNAME: ${{ secrets.COROS_USERNAME }}
+      COROS_PASSWORD: ${{ secrets.COROS_PASSWORD }}
