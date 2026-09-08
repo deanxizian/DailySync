@@ -23,9 +23,15 @@ on:
         required: false
       COROS_PASSWORD:
         required: false
+      GARMIN_OAUTH1:
+        required: true
+      GARMIN_GLOBAL_OAUTH1:
+        required: false
+      GH_SECRETS_TOKEN:
+        required: true
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   run:
@@ -34,9 +40,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6
         with:
-          ref: ${{ github.ref_name }}
-          fetch-depth: 0
-          persist-credentials: true
+          persist-credentials: false
       - uses: pnpm/action-setup@v6
         with:
           version: 11.19.0
@@ -46,6 +50,41 @@ jobs:
           node-version: '24.20.0'
           cache: pnpm
       - run: pnpm install --frozen-lockfile
+      - name: Prepare OAuth2 cache keys
+        id: cache_keys
+        env:
+          GARMIN_USERNAME: ${{ secrets.GARMIN_USERNAME }}
+          GARMIN_PASSWORD: ${{ secrets.GARMIN_PASSWORD }}
+          GARMIN_OAUTH1: ${{ secrets.GARMIN_OAUTH1 }}
+          GARMIN_GLOBAL_USERNAME: ${{ secrets.GARMIN_GLOBAL_USERNAME }}
+          GARMIN_GLOBAL_PASSWORD: ${{ secrets.GARMIN_GLOBAL_PASSWORD }}
+          GARMIN_GLOBAL_OAUTH1: ${{ secrets.GARMIN_GLOBAL_OAUTH1 }}
+        run: pnpm exec ts-node src/cli/session-cache.ts prepare
+      - name: Restore Garmin CN OAuth2
+        if: steps.cache_keys.outputs.cn_prefix != ''
+        uses: actions/cache/restore@v5
+        continue-on-error: true
+        with:
+          path: .local/oauth2/garmin-cn.json
+          key: ${{ steps.cache_keys.outputs.cn_prefix }}${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: ${{ steps.cache_keys.outputs.cn_prefix }}
+      - name: Restore Garmin Global OAuth2
+        if: steps.cache_keys.outputs.global_prefix != ''
+        uses: actions/cache/restore@v5
+        continue-on-error: true
+        with:
+          path: .local/oauth2/garmin-global.json
+          key: ${{ steps.cache_keys.outputs.global_prefix }}${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: ${{ steps.cache_keys.outputs.global_prefix }}
+      - name: Inspect restored OAuth2
+        id: cache_before
+        continue-on-error: true
+        env:
+          GARMIN_USERNAME: ${{ secrets.GARMIN_USERNAME }}
+          GARMIN_PASSWORD: ${{ secrets.GARMIN_PASSWORD }}
+          GARMIN_GLOBAL_USERNAME: ${{ secrets.GARMIN_GLOBAL_USERNAME }}
+          GARMIN_GLOBAL_PASSWORD: ${{ secrets.GARMIN_GLOBAL_PASSWORD }}
+        run: pnpm exec ts-node src/cli/session-cache.ts inspect
       - name: Run activity synchronization
         id: synchronization
         continue-on-error: true
@@ -54,24 +93,42 @@ jobs:
           ACTIVITY_ID: ${{ inputs.activity_id }}
           GARMIN_USERNAME: ${{ secrets.GARMIN_USERNAME }}
           GARMIN_PASSWORD: ${{ secrets.GARMIN_PASSWORD }}
+          GARMIN_OAUTH1: ${{ secrets.GARMIN_OAUTH1 }}
           GARMIN_GLOBAL_USERNAME: ${{ secrets.GARMIN_GLOBAL_USERNAME }}
           GARMIN_GLOBAL_PASSWORD: ${{ secrets.GARMIN_GLOBAL_PASSWORD }}
+          GARMIN_GLOBAL_OAUTH1: ${{ secrets.GARMIN_GLOBAL_OAUTH1 }}
           COROS_USERNAME: ${{ secrets.COROS_USERNAME }}
           COROS_PASSWORD: ${{ secrets.COROS_PASSWORD }}
+          GH_SECRETS_TOKEN: ${{ secrets.GH_SECRETS_TOKEN }}
         shell: bash
         run: |
           args=(--json)
           if [[ -n "$ACTIVITY_ID" ]]; then args+=(--activity-id "$ACTIVITY_ID"); fi
           pnpm run "$COMMAND" "${args[@]}"
-      - name: Persist changed Garmin Sessions
-        if: always() && github.ref == 'refs/heads/main'
+      - name: Inspect current OAuth2
+        id: cache_after
+        if: always() && steps.synchronization.outcome != 'skipped'
+        continue-on-error: true
         env:
           GARMIN_USERNAME: ${{ secrets.GARMIN_USERNAME }}
           GARMIN_PASSWORD: ${{ secrets.GARMIN_PASSWORD }}
           GARMIN_GLOBAL_USERNAME: ${{ secrets.GARMIN_GLOBAL_USERNAME }}
           GARMIN_GLOBAL_PASSWORD: ${{ secrets.GARMIN_GLOBAL_PASSWORD }}
-        shell: bash
-        run: bash scripts/commit-garmin-session.sh
+        run: pnpm exec ts-node src/cli/session-cache.ts inspect
+      - name: Save Garmin CN OAuth2
+        if: always() && steps.cache_after.outputs.cn_key != '' && steps.cache_after.outputs.cn_hash != steps.cache_before.outputs.cn_hash
+        uses: actions/cache/save@v5
+        continue-on-error: true
+        with:
+          path: .local/oauth2/garmin-cn.json
+          key: ${{ steps.cache_after.outputs.cn_key }}
+      - name: Save Garmin Global OAuth2
+        if: always() && steps.cache_after.outputs.global_key != '' && steps.cache_after.outputs.global_hash != steps.cache_before.outputs.global_hash
+        uses: actions/cache/save@v5
+        continue-on-error: true
+        with:
+          path: .local/oauth2/garmin-global.json
+          key: ${{ steps.cache_after.outputs.global_key }}
       - name: Report synchronization failure
         if: always() && steps.synchronization.outcome == 'failure'
         shell: bash

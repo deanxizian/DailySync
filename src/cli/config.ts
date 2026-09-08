@@ -11,6 +11,9 @@ export const SECRET_NAMES = [
     'GARMIN_GLOBAL_PASSWORD',
     'COROS_USERNAME',
     'COROS_PASSWORD',
+    'GARMIN_OAUTH1',
+    'GARMIN_GLOBAL_OAUTH1',
+    'GH_SECRETS_TOKEN',
 ] as const;
 
 export type SecretName = typeof SECRET_NAMES[number];
@@ -24,7 +27,7 @@ export interface CliOptions {
 
 export interface SessionOptions {
     region: 'CN' | 'GLOBAL';
-    confirmReset: boolean;
+    repository?: string;
 }
 
 export function loadPrivateEnvironment(root: string, env: NodeJS.ProcessEnv = process.env): void {
@@ -71,7 +74,7 @@ export function parseRunOptions(args: string[]): CliOptions {
 
 export function parseSessionOptions(args: string[]): SessionOptions {
     let region: SessionOptions['region'] | undefined;
-    let confirmReset = false;
+    let repository: string | undefined;
     for (let index = 0; index < args.length; index++) {
         const argument = args[index];
         if (argument === '--region') {
@@ -83,14 +86,18 @@ export function parseSessionOptions(args: string[]): SessionOptions {
             region = value;
             continue;
         }
-        if (argument === '--confirm-reset' && !confirmReset) {
-            confirmReset = true;
+        if (argument === '--repo' && !repository) {
+            const value = args[++index];
+            if (!value || !/^[A-Za-z0-9][A-Za-z0-9-]*\/[A-Za-z0-9][A-Za-z0-9_.-]*$/.test(value)) {
+                throw new SyncError('USAGE', 'Use --repo OWNER/REPO.');
+            }
+            repository = value;
             continue;
         }
         throw new SyncError('USAGE', `Unknown or duplicate maintenance option: ${argument ?? ''}.`);
     }
     if (!region) throw new SyncError('USAGE', 'Use --region CN or --region GLOBAL.');
-    return { region, confirmReset };
+    return { region, repository };
 }
 
 export function parseRoute(value: string): SyncRoute {

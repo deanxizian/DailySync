@@ -26,17 +26,18 @@ test('CLI accepts only four fixed routes, two fixed modes and an optional activi
     assert.throws(() => parseRoute('garmin-global-to-coros-cn'), { code: 'USAGE' });
 });
 
-test('Session maintenance accepts one explicit region and one reset confirmation', () => {
-    assert.deepEqual(parseSessionOptions(['--region', 'cn']), { region: 'CN', confirmReset: false });
-    assert.deepEqual(parseSessionOptions(['--confirm-reset', '--region', 'GLOBAL']),
-        { region: 'GLOBAL', confirmReset: true });
+test('Session maintenance accepts one explicit region and an optional repository', () => {
+    assert.deepEqual(parseSessionOptions(['--region', 'cn']), { region: 'CN', repository: undefined });
+    assert.deepEqual(parseSessionOptions(['--repo', 'owner/repo', '--region', 'GLOBAL']),
+        { region: 'GLOBAL', repository: 'owner/repo' });
     assert.throws(() => parseSessionOptions(['--region', 'CN', '--region', 'GLOBAL']), { code: 'USAGE' });
-    assert.throws(() => parseSessionOptions(['--region', 'CN', '--confirm-reset', '--confirm-reset']),
+    assert.throws(() => parseSessionOptions(['--region', 'CN', '--repo', 'owner/repo', '--repo', 'owner/repo']),
         { code: 'USAGE' });
+    assert.throws(() => parseSessionOptions(['--region', 'CN', '--repo', '../secret']), { code: 'USAGE' });
     assert.throws(() => parseSessionOptions(['CN']), { code: 'USAGE' });
 });
 
-test('private env loading imports only the six account settings', async t => {
+test('private env loading imports only the declared account and Session settings', async t => {
     const root = await directory(t);
     const lines = [...SECRET_NAMES.map((name, index) => `${name}=value-${index}`),
         'UNRELATED_SETTING=ignored'];

@@ -20,8 +20,7 @@
     "migrate:garmin-cn-to-coros": "ts-node src/cli/run.ts migration garmin-cn-to-coros-cn",
     "migrate:coros-to-garmin-cn": "ts-node src/cli/run.ts migration coros-cn-to-garmin-cn",
     "session:check": "ts-node src/cli/session-maintenance.ts check",
-    "session:rekey": "ts-node src/cli/session-maintenance.ts rekey",
-    "session:reset": "ts-node src/cli/session-maintenance.ts reset"
+    "session:login": "ts-node src/cli/session-maintenance.ts login"
   },
   "dependencies": {
     "@garmin/fitsdk": "21.214.0",
@@ -32,9 +31,7 @@
     "fast-xml-parser": "5.11.1",
     "form-data": "4.0.6",
     "json-bigint": "1.0.0",
-    "jszip": "3.10.1",
-    "sqlite": "5.1.1",
-    "sqlite3": "6.0.1"
+    "jszip": "3.10.1"
   },
   "devDependencies": {
     "@types/node": "24.13.3",

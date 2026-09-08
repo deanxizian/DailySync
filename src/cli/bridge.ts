@@ -5,7 +5,8 @@ import { SyncError } from '../core/errors';
 import { PlatformAdapter, SavedSession, Slot, SyncRoute } from '../core/types';
 import { CorosAdapter } from '../platforms/coros';
 import { GarminAdapter } from '../platforms/garmin';
-import { GarminCredentials, loadGarminSession, saveGarminSession } from '../state/session-db';
+import { GarminSessionStore, sessionSettings } from '../state/garmin-session';
+import { GitHubSecrets } from '../state/github-secrets';
 import { requireSecrets, RunMode, SecretName } from './config';
 
 export const DAILY_TRANSFER_LIMIT = 10;
@@ -45,22 +46,15 @@ export interface BridgeResult {
     exitCode: number;
     counts: Record<SyncEvent['status'], number>;
     events: SyncEvent[];
-    sessionChanged: boolean;
 }
 
-function garminCredentials(slot: 'garmin-cn' | 'garmin-global', env: NodeJS.ProcessEnv): GarminCredentials {
-    return slot === 'garmin-cn'
-        ? { region: 'CN', slot, username: env.GARMIN_USERNAME!, password: env.GARMIN_PASSWORD! }
-        : { region: 'GLOBAL', slot, username: env.GARMIN_GLOBAL_USERNAME!, password: env.GARMIN_GLOBAL_PASSWORD! };
-}
-
-function adapter(slot: Slot, writable: boolean, env: NodeJS.ProcessEnv): PlatformAdapter {
+function adapter(slot: Slot, writable: boolean, env: NodeJS.ProcessEnv, store?: GarminSessionStore): PlatformAdapter {
     if (slot === 'coros-cn') {
         return new CorosAdapter({ username: env.COROS_USERNAME!, password: env.COROS_PASSWORD! });
     }
-    const credentials = garminCredentials(slot, env);
+    const credentials = sessionSettings(slot, env);
     return new GarminAdapter({ region: credentials.region, username: credentials.username,
-        password: credentials.password, writable });
+        password: credentials.password, writable, onSession: saved => store!.save(saved) });
 }
 
 function emptyCounts(): Record<SyncEvent['status'], number> {
@@ -73,15 +67,21 @@ export async function runBridge(root: string, route: SyncRoute, mode: RunMode,
     requireSecrets(env, definition.secrets);
     if (mode === 'migration' && activityId) throw new SyncError('USAGE', 'Migration does not accept an activity ID.');
 
-    const source = adapter(definition.source, false, env);
-    const target = adapter(definition.target, true, env);
-    const database = path.join(root, 'db', 'garmin.db');
-    const sessions = new Map<Slot, { credentials: GarminCredentials; saved?: SavedSession; adapter: PlatformAdapter }>();
-    for (const current of [source, target]) {
-        if (current.slot === 'coros-cn') continue;
-        const credentials = garminCredentials(current.slot, env);
-        sessions.set(current.slot, { credentials, saved: await loadGarminSession(database, credentials), adapter: current });
+    const actions = env.GITHUB_ACTIONS === 'true';
+    let secrets: GitHubSecrets | undefined;
+    if (actions) {
+        requireSecrets(env, ['GH_SECRETS_TOKEN']);
+        secrets = new GitHubSecrets(env.GITHUB_REPOSITORY ?? '', env.GH_SECRETS_TOKEN);
+        await secrets.check();
     }
+    const sessions = new Map<Slot, { store: GarminSessionStore; saved?: SavedSession }>();
+    for (const slot of [definition.source, definition.target]) {
+        if (slot === 'coros-cn') continue;
+        const store = new GarminSessionStore(root, sessionSettings(slot, env), { actions, secrets });
+        sessions.set(slot, { store, saved: await store.load() });
+    }
+    const source = adapter(definition.source, false, env, sessions.get(definition.source)?.store);
+    const target = adapter(definition.target, true, env, sessions.get(definition.target)?.store);
 
     const runRoot = path.join(root, '.local', 'runs');
     await fs.mkdir(runRoot, { recursive: true, mode: 0o700 });
@@ -89,7 +89,6 @@ export async function runBridge(root: string, route: SyncRoute, mode: RunMode,
     const directory = await fs.mkdtemp(path.join(runRoot, 'run-'));
     await fs.chmod(directory, 0o700);
     let events: SyncEvent[] = [];
-    let sessionChanged = false;
     let runError: unknown;
     const synchronizer = new ActivitySynchronizer({ source, target,
         sourceSession: sessions.get(source.slot)?.saved,
@@ -101,15 +100,14 @@ export async function runBridge(root: string, route: SyncRoute, mode: RunMode,
     } catch (error) {
         runError = error;
     } finally {
-        try {
-            for (const current of sessions.values()) {
-                const exported = current.adapter.exportSession?.();
+        for (const current of [source, target]) {
+            try {
+                const exported = current.exportSession?.();
                 if (!exported) continue;
-                const result = await saveGarminSession(database, current.credentials, exported);
-                sessionChanged ||= result.changed;
+                await sessions.get(current.slot)!.store.save(exported);
+            } catch (error) {
+                runError = error;
             }
-        } catch (error) {
-            runError = error;
         }
         await fs.rm(directory, { recursive: true, force: true }).catch(() => undefined);
     }
@@ -119,5 +117,5 @@ export async function runBridge(root: string, route: SyncRoute, mode: RunMode,
     for (const event of events) counts[event.status]++;
     return { route, mode, limit: mode === 'migration' ? MIGRATION_TRANSFER_LIMIT : DAILY_TRANSFER_LIMIT,
         transferLimitReached: synchronizer.transferLimitReached,
-        outcome: syncOutcome(events), exitCode: syncExitCode(events), counts, events, sessionChanged };
+        outcome: syncOutcome(events), exitCode: syncExitCode(events), counts, events };
 }

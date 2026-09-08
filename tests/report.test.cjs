@@ -10,7 +10,7 @@ function result(events) {
     const counts = { uploaded: 0, existing: 0, review: 0, verifying: 0, failed: 0, unsupported: 0, deferred: 0 };
     for (const event of events) counts[event.status]++;
     return { route: 'garmin-cn-to-coros-cn', mode: 'migration', limit: 100,
-        transferLimitReached: false, outcome: 'partial', exitCode: 0, counts, events, sessionChanged: false };
+        transferLimitReached: false, outcome: 'partial', exitCode: 0, counts, events };
 }
 
 test('machine output omits repetitive existing events and groups attention codes', () => {

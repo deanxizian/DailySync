@@ -12,5 +12,4 @@
 *.gpx
 *.zip
 
-/db/*
-!/db/garmin.db
+*.db

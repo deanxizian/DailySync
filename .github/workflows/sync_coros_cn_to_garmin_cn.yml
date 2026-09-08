@@ -15,7 +15,7 @@ concurrency:
   cancel-in-progress: false
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   sync:
@@ -26,7 +26,7 @@ jobs:
     secrets:
       GARMIN_USERNAME: ${{ secrets.GARMIN_USERNAME }}
       GARMIN_PASSWORD: ${{ secrets.GARMIN_PASSWORD }}
-      GARMIN_GLOBAL_USERNAME: ${{ secrets.GARMIN_GLOBAL_USERNAME }}
-      GARMIN_GLOBAL_PASSWORD: ${{ secrets.GARMIN_GLOBAL_PASSWORD }}
+      GARMIN_OAUTH1: ${{ secrets.GARMIN_OAUTH1 }}
+      GH_SECRETS_TOKEN: ${{ secrets.GH_SECRETS_TOKEN }}
       COROS_USERNAME: ${{ secrets.COROS_USERNAME }}
       COROS_PASSWORD: ${{ secrets.COROS_PASSWORD }}

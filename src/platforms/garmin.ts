@@ -33,6 +33,7 @@ export interface GarminAdapterOptions {
     wait?: (milliseconds: number) => Promise<void>;
     pageSize?: number;
     writable?: boolean;
+    onSession?: (saved: SavedSession) => Promise<void>;
 }
 
 function utcDay(timestamp: number): string {
@@ -192,7 +193,18 @@ export class GarminAdapter implements PlatformAdapter {
                 throw new SyncError('ACCOUNT_CHANGED', `${this.config.label} saved session belongs to a different account.`);
             }
             await this.client.loadToken(saved.token.oauth1, saved.token.oauth2);
-            try { profile = await this.read<any>(() => this.client.getUserProfile()); }
+            try {
+                if (!saved.token.oauth2 || !Number.isFinite(saved.token.oauth2.expires_at) ||
+                    saved.token.oauth2.expires_at <= Date.now() / 1000 + 60) {
+                    await this.read(async () => {
+                        const http = this.client.client;
+                        await http.fetchOauthConsumer();
+                        // The SDK refresh helper requires OAuth2; a cache miss must exchange OAuth1 directly.
+                        await http.exchange({ oauth: http.getOauthClient(http.OAUTH_CONSUMER), token: saved.token.oauth1 });
+                    });
+                }
+                profile = await this.read<any>(() => this.client.getUserProfile());
+            }
             catch (error) {
                 if (!(error instanceof SyncError) || error.code !== 'GARMIN_SESSION_INVALID') throw error;
                 profile = await this.passwordLogin();
@@ -202,6 +214,11 @@ export class GarminAdapter implements PlatformAdapter {
         }
         const identity = remoteId(profile?.profileId ?? profile?.displayName ?? profile?.userName);
         this.connected = true;
+        if (this.options.onSession) {
+            const exported = this.exportSession();
+            if (!exported) throw new SyncError('SESSION_INVALID', 'Garmin did not export a verified OAuth Session.');
+            await this.options.onSession(exported);
+        }
         return createHash('sha256').update(`${this.slot}:${identity}`).digest('hex');
     }
 

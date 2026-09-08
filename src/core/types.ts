@@ -48,7 +48,7 @@ export interface Transfer {
 
 export interface SavedSession {
     loginHash: string;
-    token: { oauth1: Record<string, any>; oauth2: Record<string, any> };
+    token: { oauth1: Record<string, any>; oauth2?: Record<string, any> };
 }
 
 export interface PlatformAdapter {

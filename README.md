@@ -36,7 +36,7 @@ DailySync 提供四个方向的日常同步和历史迁移：
 
 项目不保存活动映射和时间游标。目标端被人工删除的活动可能在后续完整扫描中被重新补回。
 
-单条活动存在匹配歧义、格式不支持或异步导入结果暂时未知时，该活动会被跳过并显示在 Action 摘要中，其他活动继续处理。认证失败、历史扫描不完整、平台协议异常、状态数据库错误等系统性问题会终止任务。
+单条活动存在匹配歧义、格式不支持或异步导入结果暂时未知时，该活动会被跳过并显示在 Action 摘要中，其他活动继续处理。认证失败、历史扫描不完整、平台协议异常、长期凭据保存失败等系统性问题会终止任务。
 
 ## 文件格式
 
@@ -56,13 +56,28 @@ GPX 转换保留轨迹、时间、海拔，以及文件中已有的心率、踏�
 | Secret | 用途 |
 | --- | --- |
 | `GARMIN_USERNAME` | 佳明国区账号 |
-| `GARMIN_PASSWORD` | 佳明国区密码及 Session 加密密钥来源 |
+| `GARMIN_PASSWORD` | 佳明国区密码及缓存加密密钥来源 |
 | `GARMIN_GLOBAL_USERNAME` | 佳明国际区账号 |
-| `GARMIN_GLOBAL_PASSWORD` | 佳明国际区密码及 Session 加密密钥来源 |
+| `GARMIN_GLOBAL_PASSWORD` | 佳明国际区密码及缓存加密密钥来源 |
 | `COROS_USERNAME` | 高驰国区账号 |
 | `COROS_PASSWORD` | 高驰国区密码 |
+| `GARMIN_OAUTH1` | 佳明国区长期 OAuth1，由本地登录命令写入 |
+| `GARMIN_GLOBAL_OAUTH1` | 佳明国际区长期 OAuth1，由本地登录命令写入 |
+| `GH_SECRETS_TOKEN` | 仅用于自动更新上述两个 OAuth1 Secret 的细粒度 PAT |
 
 账号与密码只通过 GitHub Secrets 或本地私有环境文件提供，不应写入仓库。
+
+在 GitHub [细粒度 Token 设置](https://github.com/settings/personal-access-tokens/new)中创建 PAT：Resource owner 选择仓库所有者，Repository access 只选择此仓库，Repository permissions 中的 **Secrets** 设为 **Read and write**。将生成的完整 Token 保存为 `GH_SECRETS_TOKEN`，按所选有效期及时更换；不需要 Contents 写入权限。
+
+配置本地六个账号变量后，使用已登录的 GitHub CLI 写入两个 OAuth1 Secret：
+
+```bash
+gh auth login
+pnpm session:login --region CN --repo OWNER/REPO
+pnpm session:login --region GLOBAL --repo OWNER/REPO
+```
+
+将 `OWNER/REPO` 替换为自己的仓库。命令在本地登录佳明、核验账号，然后直接写入 GitHub Secrets，不显示或导出 Token。执行时应避开同账号的其他同步任务。
 
 ## GitHub Actions
 
@@ -75,31 +90,26 @@ GPX 转换保留轨迹、时间、海拔，以及文件中已有的心率、踏�
 | 佳明国区 → 高驰国区 | `0 2,8,14,20 * * *` | 04、10、16、22 点 |
 | 高驰国区 → 佳明国区 | `0 3,9,15,21 * * *` | 05、11、17、23 点 |
 
-四个历史迁移任务仅支持手动触发。全部同步和迁移任务共用同一个并发组，避免同时访问相同账号或同时修改 Session 数据库。单次作业使用 GitHub Actions 的 6 小时上限。
+四个历史迁移任务仅支持手动触发。全部同步和迁移任务共用同一个并发组，避免同时访问相同账号或更新相同凭据。单次作业使用 GitHub Actions 的 6 小时上限。
 
-活动同步不会修改仓库文件。只有佳明 OAuth Session 确实刷新时，工作流才会提交更新后的 `db/garmin.db`，提交消息固定为：
-
-```text
-Update Garmin sessions [skip ci]
-```
-
-Session 提交不会触发同步任务，也不会覆盖远端并发更新。
+工作流仅申请仓库内容读取权限，不执行 Git 暂存、提交或推送。活动同步和凭据刷新均不会产生 Commit。
 
 ## Garmin Session
 
-`db/garmin.db` 只保存佳明国区和国际区的 OAuth Session：
+佳明凭据分两层保存：
 
-- 每个区域使用独立随机盐；
-- 通过对应佳明密码和 `scrypt` 派生 256 位密钥；
-- 使用 AES-256-GCM 加密并校验完整性；
-- 数据库仅保存区域、账号哈希、盐、IV、认证标签和密文；
-- 不保存明文账号、密码、运动活动或同步游标。
+- **OAuth1** 是长期凭据，保存在对应区域的 GitHub Secret 中。
+- **OAuth2** 是短期访问凭据，使用对应佳明密码、随机盐和 `scrypt` 派生密钥，以 AES-256-GCM 加密后保存到 Actions Cache。
 
-每次连接后都会比较规范化的 Session 内容。内容相同时数据库保持逐字节不变；只有 Session 确实刷新时才更新对应记录。
+缓存按区域、账号和 OAuth1 版本隔离，不包含 OAuth1、明文密码或活动文件。OAuth2 不变时不创建新缓存。缓存丢失、过期或损坏时，直接用 OAuth1 换取新的 OAuth2；缓存服务不可用只产生警告，不会阻止已完成的同步。
+
+只有 OAuth1 被佳明确认失效时，才尝试一次密码登录。新凭据经账号核验后，先自动更新对应 Secret，再进行活动同步。OAuth1 未变化时不写 Secret。验证码、二次验证或凭据回写失败会终止任务，不绕过验证，也不把未保存的长期凭据当作已保存。
+
+Actions 启动时检查 `GH_SECRETS_TOKEN` 的可用性。该 Token 过期或被撤销时，需要更新它；GitHub Secrets 中缺少或损坏的 OAuth1 不会被 Actions 自动初始化。项目不使用 Session 数据库，也不将凭据提交到 Git。
 
 ## 本地运行
 
-本地环境需要 Node.js 24.20 或更高版本，以及 pnpm 11.19。
+本地环境需要 Node.js 24.20 或更高版本，以及 pnpm 11.19。将 OAuth1 写入 GitHub 时还需要 GitHub CLI。
 
 ```bash
 pnpm install --frozen-lockfile
@@ -129,36 +139,39 @@ pnpm migrate:garmin-cn-to-coros
 pnpm migrate:coros-to-garmin-cn
 ```
 
-本地与 Actions 使用同一套同步引擎和查重规则。本地运行锁位于 `.local/`，下载的活动文件仅存在于本次运行的私有临时目录，任务结束后会自动清理。
+本地与 Actions 使用同一套同步引擎和查重规则。本地 OAuth1 加密保存在 `.local/oauth1/`，OAuth2 加密保存在 `.local/oauth2/`，都不会进入 Git；本地运行不会自动更新 GitHub Secrets。首次本地运行没有凭据时会使用账号密码登录。
+
+本地运行锁位于 `.local/`，下载的活动文件仅存在于本次运行的私有临时目录，任务结束后会自动清理。本地锁与 Actions 并发组不跨机器互锁，应避免同时运行同账号任务。
 
 ## 密码维护
 
-佳明密码也是对应 Session 的加密密钥来源。修改佳明密码时，应先使用旧密码重新加密数据库记录，再更新 GitHub Secret：
+修改佳明密码后，同步更新对应的 Password Secret 和 `.env.local`。旧 OAuth2 缓存无法解密时会自动丢弃；OAuth1 仍有效时可直接换取新 OAuth2。
+
+需要替换本地长期凭据或重新配置 GitHub OAuth1 时，执行对应区域的登录命令：
 
 ```bash
-pnpm session:rekey --region CN
-pnpm session:rekey --region GLOBAL
+pnpm session:login --region CN --repo OWNER/REPO
+pnpm session:login --region GLOBAL --repo OWNER/REPO
 ```
 
-命令通过隐藏的标准输入读取新密码。旧密码不可用时，可以在 `.env.local` 中配置新密码后重新登录并替换对应 Session：
+省略 `--repo` 时只更新本地凭据。以下命令核验本地连接，不上传活动：
 
 ```bash
-pnpm session:reset --region CN --confirm-reset
-pnpm session:reset --region GLOBAL --confirm-reset
+pnpm session:check --region CN
+pnpm session:check --region GLOBAL
 ```
 
-Session 重置只能在本地执行。登录失败或数据库校验失败时，现有记录不会被覆盖。
+登录失败时不会覆盖已有长期凭据。命令不会将密码或 Token 输出到终端。
 
 ## 项目结构
 
 ```text
 .github/workflows  同步、迁移和 CI 工作流
-scripts            Session 提交保护脚本
 src/cli            命令入口、配置、报告和运行锁
 src/core           同步引擎、类型与错误边界
 src/formats        FIT、TCX 和 GPX 处理
 src/platforms      Garmin 与 COROS 平台适配器
-src/state          Garmin Session 加密数据库
+src/state          OAuth1 Secret 与加密 OAuth2 缓存
 tests              引擎、平台、格式、状态和工作流测试
 ```
 

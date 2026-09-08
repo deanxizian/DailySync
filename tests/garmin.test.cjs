@@ -7,14 +7,14 @@ const path = require('node:path');
 const JSZip = require('jszip');
 const { GarminConnect } = require('@gooin/garmin-connect');
 const { garminAccountHash } = require('../src/core/account');
-const { safeError } = require('../src/core/errors');
+const { safeError, SyncError } = require('../src/core/errors');
 const { GarminAdapter, normalizeGarmin } = require('../src/platforms/garmin');
 const { activity, hash, start } = require('./helpers.cjs');
 
 const username = 'test@example.invalid';
 const password = 'test-password';
 const tokens = { oauth1: { oauth_token: 'test-oauth1', oauth_token_secret: 'test-secret' },
-    oauth2: { access_token: 'test-oauth2', expires_at: 1700000000 } };
+    oauth2: { access_token: 'test-oauth2', expires_at: Math.floor(Date.now() / 1000) + 3600 } };
 const profile = { profileId: 123, displayName: 'display-name' };
 const row = { activityId: 321, startTimeGMT: '2025-04-06 03:00:00', startTimeLocal: '2025-04-06 11:00:00',
     activityType: { typeKey: 'trail_running' }, duration: 1800, distance: 5000 };
@@ -36,7 +36,8 @@ function fixture(options = {}) {
         client.loadToken(tokens.oauth1, tokens.oauth2);
     };
     f.adapter = new GarminAdapter({ region, username, password, client,
-        wait: async delay => { waits.push(delay); }, pageSize: options.pageSize, writable: options.writable });
+        wait: async delay => { waits.push(delay); }, pageSize: options.pageSize, writable: options.writable,
+        onSession: options.onSession });
     client.client.refreshOauth2Token = async () => {
         f.refreshes++;
         client.loadToken(tokens.oauth1, { ...tokens.oauth2, access_token: 'refreshed' });
@@ -94,6 +95,69 @@ test('Garmin performs one password login when no Session exists', async () => {
     await assert.rejects(rejected.adapter.connect(), { code: 'AUTH' });
     assert.equal(rejected.logins, 1);
     assert.equal(rejected.adapter.exportSession(), undefined);
+});
+
+test('OAuth1 alone or an expired OAuth2 uses the signed exchange, not password login, in both regions', async () => {
+    for (const region of ['CN', 'GLOBAL']) {
+        for (const oauth2 of [undefined, { ...tokens.oauth2, expires_at: 1 }]) {
+            const persisted = [];
+            const f = fixture({ region, onSession: async saved => persisted.push(saved), handler: config =>
+                config.url.includes('/oauth-service/oauth/exchange/user/2.0')
+                    ? { status: 200, data: { access_token: 'exchanged', expires_in: 3600,
+                        refresh_token: 'new-refresh', refresh_token_expires_in: 86400 } } : undefined });
+            f.client.client.fetchOauthConsumer = async () => {
+                f.client.client.OAUTH_CONSUMER = { key: 'consumer-key', secret: 'consumer-secret' };
+            };
+            await f.adapter.connect({ ...f.saved, token: { oauth1: tokens.oauth1, oauth2 } });
+            assert.equal(f.logins, 0);
+            assert.equal(f.refreshes, 0);
+            const exchanges = f.calls.filter(call => call.url.includes('/oauth-service/oauth/exchange/user/2.0'));
+            assert.equal(exchanges.length, 1);
+            assert.equal(exchanges[0].method, 'post');
+            assert.equal(new URL(exchanges[0].url).hostname, region === 'CN' ? 'connectapi.garmin.cn' : 'connectapi.garmin.com');
+            assert.equal(persisted.length, 1);
+            assert.equal(persisted[0].token.oauth2.access_token, 'exchanged');
+            assert.deepEqual(persisted[0].token.oauth1, tokens.oauth1);
+        }
+    }
+});
+
+test('rejected OAuth1 falls back once and persists the verified replacement before returning', async () => {
+    const saved = [];
+    const f = fixture({ allowLogin: true, onSession: async session => saved.push(session), handler: config =>
+        config.url.includes('/oauth-service/oauth/exchange/user/2.0') ? { status: 401 } : undefined });
+    f.client.client.fetchOauthConsumer = async () => {
+        f.client.client.OAUTH_CONSUMER = { key: 'consumer-key', secret: 'consumer-secret' };
+    };
+    f.client.login = async () => {
+        f.logins++;
+        f.client.loadToken({ ...tokens.oauth1, oauth_token: 'replacement' }, tokens.oauth2);
+    };
+    await f.adapter.connect({ ...f.saved, token: { oauth1: tokens.oauth1 } });
+    assert.equal(f.logins, 1);
+    assert.equal(saved.length, 1);
+    assert.equal(saved[0].token.oauth1.oauth_token, 'replacement');
+});
+
+test('OAuth1 exchange throttling does not trigger password login', async () => {
+    const f = fixture({ allowLogin: true });
+    f.client.client.fetchOauthConsumer = async () => {
+        throw Object.assign(new Error('private-token'), { response: { status: 429 } });
+    };
+    await assert.rejects(f.adapter.connect({ ...f.saved, token: { oauth1: tokens.oauth1 } }),
+        error => error.code === 'GARMIN_READ' && !safeError(error).includes('private-token'));
+    assert.equal(f.logins, 0);
+    assert.deepEqual(f.waits, [1000, 2000, 4000]);
+});
+
+test('unverified Sessions are never persisted, and persistence failure aborts connect', async () => {
+    const calls = [];
+    const rejected = fixture({ onSession: async session => calls.push(session) });
+    await assert.rejects(rejected.adapter.connect(), { code: 'AUTH' });
+    assert.equal(calls.length, 0);
+    const failedSave = fixture({ onSession: async () => { throw new SyncError('GITHUB_SECRETS', 'Save failed.'); } });
+    await assert.rejects(failedSave.adapter.connect(failedSave.saved), { code: 'GITHUB_SECRETS' });
+    assert.ok(failedSave.adapter.exportSession());
 });
 
 test('Garmin reads complete pages and applies bounded UTC date filters', async () => {
