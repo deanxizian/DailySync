@@ -193,12 +193,22 @@ export class GarminAdapter implements PlatformAdapter {
                 throw new SyncError('ACCOUNT_CHANGED', `${this.config.label} saved session belongs to a different account.`);
             }
             await this.client.loadToken(saved.token.oauth1, saved.token.oauth2);
+            const needsExchange = !saved.token.oauth2 || !Number.isFinite(saved.token.oauth2.expires_at) ||
+                saved.token.oauth2.expires_at <= Date.now() / 1000 + 60;
+            if (needsExchange) {
+                // Consumer metadata is not account authentication; its failure must never trigger password login.
+                try { await this.read(() => this.client.client.fetchOauthConsumer()); }
+                catch (error) {
+                    if (error instanceof SyncError && error.code === 'GARMIN_SESSION_INVALID') {
+                        throw new SyncError('GARMIN_READ', error.message);
+                    }
+                    throw error;
+                }
+            }
             try {
-                if (!saved.token.oauth2 || !Number.isFinite(saved.token.oauth2.expires_at) ||
-                    saved.token.oauth2.expires_at <= Date.now() / 1000 + 60) {
+                if (needsExchange) {
                     await this.read(async () => {
                         const http = this.client.client;
-                        await http.fetchOauthConsumer();
                         // The SDK refresh helper requires OAuth2; a cache miss must exchange OAuth1 directly.
                         await http.exchange({ oauth: http.getOauthClient(http.OAUTH_CONSUMER), token: saved.token.oauth1 });
                     });

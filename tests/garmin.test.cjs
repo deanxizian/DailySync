@@ -77,6 +77,7 @@ test('Garmin normalization uses UTC, stable sport families and lossless IDs for 
 
 test('Garmin uses a saved Session first and exports it only after a verified connection', async () => {
     const f = fixture();
+    f.client.client.fetchOauthConsumer = async () => { throw new Error('Unexpected consumer metadata request'); };
     assert.equal(f.adapter.exportSession(), undefined);
     assert.equal(await f.adapter.connect(f.saved), hash('garmin-cn:123'));
     assert.equal(f.logins, 0);
@@ -123,31 +124,89 @@ test('OAuth1 alone or an expired OAuth2 uses the signed exchange, not password l
 });
 
 test('rejected OAuth1 falls back once and persists the verified replacement before returning', async () => {
-    const saved = [];
-    const f = fixture({ allowLogin: true, onSession: async session => saved.push(session), handler: config =>
-        config.url.includes('/oauth-service/oauth/exchange/user/2.0') ? { status: 401 } : undefined });
-    f.client.client.fetchOauthConsumer = async () => {
-        f.client.client.OAUTH_CONSUMER = { key: 'consumer-key', secret: 'consumer-secret' };
-    };
-    f.client.login = async () => {
-        f.logins++;
-        f.client.loadToken({ ...tokens.oauth1, oauth_token: 'replacement' }, tokens.oauth2);
-    };
-    await f.adapter.connect({ ...f.saved, token: { oauth1: tokens.oauth1 } });
-    assert.equal(f.logins, 1);
-    assert.equal(saved.length, 1);
-    assert.equal(saved[0].token.oauth1.oauth_token, 'replacement');
+    for (const region of ['CN', 'GLOBAL']) {
+        for (const status of [401, 403]) {
+            for (const oauth2 of [undefined, { ...tokens.oauth2, expires_at: 1 }]) {
+                const saved = [];
+                const f = fixture({ region, allowLogin: true, onSession: async session => saved.push(session), handler: config =>
+                    config.url.includes('/oauth-service/oauth/exchange/user/2.0') ? { status } : undefined });
+                f.client.client.fetchOauthConsumer = async () => {
+                    f.client.client.OAUTH_CONSUMER = { key: 'consumer-key', secret: 'consumer-secret' };
+                };
+                f.client.login = async () => {
+                    f.logins++;
+                    f.client.loadToken({ ...tokens.oauth1, oauth_token: 'replacement' }, tokens.oauth2);
+                };
+                await f.adapter.connect({ ...f.saved, token: { oauth1: tokens.oauth1, oauth2 } });
+                assert.equal(f.logins, 1);
+                assert.equal(f.refreshes, 0);
+                assert.equal(f.calls.filter(call => call.url.includes('/oauth-service/oauth/exchange/user/2.0')).length, 1);
+                assert.equal(saved.length, 1);
+                assert.equal(saved[0].token.oauth1.oauth_token, 'replacement');
+            }
+        }
+    }
 });
 
-test('OAuth1 exchange throttling does not trigger password login', async () => {
-    const f = fixture({ allowLogin: true });
+test('consumer metadata authorization failures never trigger password login or persist a Session', async () => {
+    for (const region of ['CN', 'GLOBAL']) {
+        for (const status of [401, 403]) {
+            for (const oauth2 of [undefined, { ...tokens.oauth2, expires_at: 1 }]) {
+                const saved = [];
+                let consumerFetches = 0;
+                const f = fixture({ region, allowLogin: true, onSession: async session => saved.push(session) });
+                f.client.client.fetchOauthConsumer = async () => {
+                    consumerFetches++;
+                    throw Object.assign(new Error('private-token'), { response: { status } });
+                };
+                await assert.rejects(f.adapter.connect({ ...f.saved, token: { oauth1: tokens.oauth1, oauth2 } }),
+                    error => error.code === 'GARMIN_READ' && safeError(error).includes(`HTTP ${status}`) &&
+                        !safeError(error).includes('private-token'));
+                assert.equal(consumerFetches, 1);
+                assert.equal(f.logins, 0);
+                assert.equal(f.refreshes, 0);
+                assert.deepEqual(f.calls, []);
+                assert.deepEqual(f.waits, []);
+                assert.deepEqual(saved, []);
+                assert.equal(f.adapter.exportSession(), undefined);
+            }
+        }
+    }
+});
+
+test('consumer metadata transient failures exhaust bounded retries without password login', async () => {
+    for (const status of [429, 503]) {
+        let consumerFetches = 0;
+        const f = fixture({ allowLogin: true });
+        f.client.client.fetchOauthConsumer = async () => {
+            consumerFetches++;
+            throw Object.assign(new Error('private-token'), { response: { status } });
+        };
+        await assert.rejects(f.adapter.connect({ ...f.saved, token: { oauth1: tokens.oauth1 } }),
+            error => error.code === 'GARMIN_READ' && !safeError(error).includes('private-token'));
+        assert.equal(consumerFetches, 4);
+        assert.equal(f.logins, 0);
+        assert.deepEqual(f.calls, []);
+        assert.deepEqual(f.waits, [1000, 2000, 4000]);
+        assert.equal(f.adapter.exportSession(), undefined);
+    }
+});
+
+test('OAuth1 exchange throttling retries only the exchange without password login', async () => {
+    let consumerFetches = 0;
+    const f = fixture({ allowLogin: true, handler: () => ({ status: 429 }) });
     f.client.client.fetchOauthConsumer = async () => {
-        throw Object.assign(new Error('private-token'), { response: { status: 429 } });
+        consumerFetches++;
+        f.client.client.OAUTH_CONSUMER = { key: 'consumer-key', secret: 'consumer-secret' };
     };
     await assert.rejects(f.adapter.connect({ ...f.saved, token: { oauth1: tokens.oauth1 } }),
-        error => error.code === 'GARMIN_READ' && !safeError(error).includes('private-token'));
+        error => error.code === 'GARMIN_READ' && !safeError(error).includes('private response body'));
+    assert.equal(consumerFetches, 1);
+    assert.equal(f.calls.length, 4);
+    assert.ok(f.calls.every(call => call.url.includes('/oauth-service/oauth/exchange/user/2.0')));
     assert.equal(f.logins, 0);
     assert.deepEqual(f.waits, [1000, 2000, 4000]);
+    assert.equal(f.adapter.exportSession(), undefined);
 });
 
 test('unverified Sessions are never persisted, and persistence failure aborts connect', async () => {
