@@ -307,13 +307,13 @@ export class ActivitySynchronizer {
     }
 
     private mergeReceipt(transfer: Transfer, receipt: ImportReceipt): ImportReceipt {
-        transfer.receipt = { ...transfer.receipt, ...receipt, code: receipt.code };
+        transfer.receipt = { ...transfer.receipt, ...receipt, code: receipt.code, detail: receipt.detail };
         return transfer.receipt;
     }
 
-    private throwIfSystemicImportFailure(code?: string): void {
-        if (code && SYSTEMIC_IMPORT_CODES.has(code)) {
-            throw new SyncError(code, 'The target import service or local transfer invariant failed.');
+    private throwIfSystemicImportFailure(receipt: ImportReceipt): void {
+        if (receipt.code && SYSTEMIC_IMPORT_CODES.has(receipt.code)) {
+            throw new SyncError(receipt.code, receipt.detail ?? 'The target import service or local transfer invariant failed.');
         }
     }
 
@@ -321,12 +321,12 @@ export class ActivitySynchronizer {
         let receipt: ImportReceipt | undefined;
         if (initial) {
             receipt = this.mergeReceipt(transfer, initial);
-            this.throwIfSystemicImportFailure(initial.code);
+            this.throwIfSystemicImportFailure(initial);
         }
         const rounds = this.options.pollAttempts ?? 6;
         for (let round = 0; round < rounds; round++) {
             receipt ??= this.mergeReceipt(transfer, await this.deps.target.verify(transfer));
-            this.throwIfSystemicImportFailure(receipt.code);
+            this.throwIfSystemicImportFailure(receipt);
             if (receipt.status === 'retryable') return { status: 'deferred', code: receipt.code ?? 'COROS_IMPORT_RETRY' };
             // The activity inventory is authoritative. COROS keeps only a bounded
             // import-task history, and a task can still say pending after the
@@ -456,7 +456,7 @@ export class ActivitySynchronizer {
             catch (_) { receipt = { status: 'unknown', code: 'UPLOAD_OUTCOME_UNKNOWN' }; }
             this.mergeReceipt(transfer, receipt);
             if (receipt.status === 'failed') {
-                this.throwIfSystemicImportFailure(receipt.code);
+                this.throwIfSystemicImportFailure(receipt);
                 this.event(source, 'failed', { code: receipt.code });
                 continue;
             }

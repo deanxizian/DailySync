@@ -11,7 +11,8 @@ import { MAX_ACTIVITY_BYTES, MIN_ACTIVITY_BYTES } from '../formats/files';
 const JSONbig = require('json-bigint')({ storeAsString: true, protoAction: 'error', constructorAction: 'error' });
 const OSS = require('ali-oss');
 const BASE = 'https://teamcnapi.coros.com';
-const HUB = 'https://t.coros.com';
+// The shared t.coros.com proxy can reject China tokens on overseas runners.
+const HUB = 'https://trainingcn.coros.com';
 const STS_MARKER = '9y78gpoERW4lBNYL';
 const AUTH_CODES = new Set(['1019', 'ACCESS_TOKEN_IS_INVALID']);
 const SPORTS: Record<number, string> = {
@@ -26,14 +27,15 @@ const ACTIVITY_PAGE_SIZE = 20;
 const DAY_MS = 24 * 60 * 60 * 1000;
 const CHINA_OFFSET_MS = 8 * 60 * 60 * 1000;
 const ORPHAN_OBJECT_GRACE_MS = 15 * 60 * 1000;
+const TRANSPORT_CODES = new Set(['ECONNABORTED', 'ECONNRESET', 'ETIMEDOUT', 'ENOTFOUND', 'EAI_AGAIN', 'ERR_NETWORK']);
 
 function chinaDay(timestamp: number): string {
     return new Date(timestamp + CHINA_OFFSET_MS).toISOString().slice(0, 10).replace(/-/g, '');
 }
 
 class CorosHttpError extends SyncError {
-    constructor(public readonly status: number) {
-        super('HTTP', `COROS returned HTTP ${status}.`);
+    constructor(public readonly status: number, operation: string) {
+        super('HTTP', `COROS ${operation} returned HTTP ${status}.`);
     }
 }
 
@@ -108,17 +110,21 @@ export class CorosAdapter implements PlatformAdapter {
             YFHeader: JSON.stringify({ userId: this.userId, language: 'en-US' }) };
     }
 
-    private async raw(config: AxiosRequestConfig, retryRead: boolean): Promise<any> {
+    private async raw(config: AxiosRequestConfig, retryTransient: boolean): Promise<any> {
+        const url = new URL(config.url!);
+        const operation = `${config.method} ${url.origin}${url.pathname}`;
         for (let attempt = 0; ; attempt++) {
             let response;
             try {
                 response = await this.http.request({ timeout: 30000, maxRedirects: 0, maxContentLength: MAX_ACTIVITY_BYTES,
                     maxBodyLength: MAX_ACTIVITY_BYTES, validateStatus: () => true, transformResponse: [value => value], ...config });
-            } catch (_) {
-                if (retryRead && attempt < 3) { await this.wait(1000 * 2 ** attempt); continue; }
-                throw new SyncError('TRANSPORT', 'COROS request did not return a usable response.');
+            } catch (error) {
+                if (retryTransient && attempt < 3) { await this.wait(1000 * 2 ** attempt); continue; }
+                const code = (error as { code?: unknown })?.code;
+                const reason = typeof code === 'string' && TRANSPORT_CODES.has(code) ? ` (${code})` : '';
+                throw new SyncError('TRANSPORT', `COROS ${operation} failed after ${attempt + 1} attempt(s)${reason}.`);
             }
-            if (retryRead && (response.status === 429 || response.status >= 500) && attempt < 3) {
+            if (retryTransient && (response.status === 429 || response.status >= 500) && attempt < 3) {
                 const retry = response.headers?.['retry-after'];
                 const seconds = Number(retry);
                 const delay = Number.isFinite(seconds) ? seconds * 1000 : Date.parse(String(retry)) - Date.now();
@@ -129,10 +135,12 @@ export class CorosAdapter implements PlatformAdapter {
             if (response.status === 429) {
                 throw new SyncError('RATE_LIMIT', 'COROS rate limit persisted after bounded retries; resume in a later run.');
             }
-            if (response.status === 401 || response.status === 403) throw new SyncError('AUTH', 'COROS authentication was rejected.');
-            if (response.status < 200 || response.status >= 300) throw new CorosHttpError(response.status);
+            if (response.status === 401 || response.status === 403) {
+                throw new SyncError('AUTH', `COROS ${operation} returned HTTP ${response.status}; authentication was rejected.`);
+            }
+            if (response.status < 200 || response.status >= 300) throw new CorosHttpError(response.status, operation);
             try { return typeof response.data === 'string' ? JSONbig.parse(response.data) : response.data; }
-            catch (_) { throw new SyncError('PROTOCOL', 'COROS response was not valid JSON.'); }
+            catch (_) { throw new SyncError('PROTOCOL', `COROS ${operation} did not return valid JSON.`); }
         }
     }
 
@@ -140,7 +148,7 @@ export class CorosAdapter implements PlatformAdapter {
         const result = await this.raw({ url: `${BASE}/account/login`, method: 'POST',
             headers: { origin: HUB, referer: `${HUB}/`, 'content-type': 'application/json' },
             data: { account: this.options.username, accountType: 2,
-                pwd: createHash('md5').update(this.options.password).digest('hex') } }, false);
+                pwd: createHash('md5').update(this.options.password).digest('hex') } }, true);
         if (result?.result !== '0000' || typeof result.data?.accessToken !== 'string' || !result.data.accessToken ||
             result.data.accessToken.length > 4096 || /[\x00-\x20\x7f;,]/.test(result.data.accessToken)) {
             throw new SyncError('AUTH', 'COROS password login failed or requires an interactive verification.');
@@ -148,25 +156,29 @@ export class CorosAdapter implements PlatformAdapter {
         this.token = result.data.accessToken;
     }
 
-    private async api(endpoint: string, method: 'GET' | 'POST', data?: any, params?: any, read = true): Promise<any> {
-        const perform = () => this.raw({ url: `${BASE}${endpoint}`, method, data, params,
-            headers: { ...this.headers(), ...(data instanceof FormData ? data.getHeaders() : {}) } }, read);
-        let result;
-        try { result = await perform(); }
+    private async authenticatedRead<T>(perform: () => Promise<T>): Promise<T> {
+        try { return await perform(); }
         catch (error) {
-            if (!(error instanceof SyncError) || error.code !== 'AUTH' || !read || this.relogins >= 1) throw error;
-            result = { result: '1019' };
-        }
-        if (AUTH_CODES.has(result?.result) && read && this.relogins < 1) {
+            if (!(error instanceof SyncError) || error.code !== 'AUTH' || this.relogins >= 1) throw error;
             this.relogins++;
             await this.login();
             const profile = await this.api('/account/query', 'GET');
             if (this.userId && remoteId(profile?.userId) !== this.userId) throw new SyncError('ACCOUNT_CHANGED', 'COROS account changed during login.');
-            result = await perform();
+            return perform();
         }
-        if (AUTH_CODES.has(result?.result)) throw new SyncError('AUTH', 'COROS session expired; no write was retried.');
-        if (result?.result !== '0000') throw new SyncError('COROS_REJECTED', 'COROS rejected the request or changed its response contract.');
-        return result.data;
+    }
+
+    private async api(endpoint: string, method: 'GET' | 'POST', data?: any, params?: any, read = true): Promise<any> {
+        const perform = async () => {
+            const result = await this.raw({ url: `${BASE}${endpoint}`, method, data, params,
+                headers: { ...this.headers(), ...(data instanceof FormData ? data.getHeaders() : {}) } }, read);
+            if (AUTH_CODES.has(result?.result)) {
+                throw new SyncError('AUTH', `COROS ${method} ${endpoint} rejected the session; no write was retried.`);
+            }
+            if (result?.result !== '0000') throw new SyncError('COROS_REJECTED', 'COROS rejected the request or changed its response contract.');
+            return result.data;
+        };
+        return read ? this.authenticatedRead(perform) : perform();
     }
 
     async connect(): Promise<string> {
@@ -263,9 +275,9 @@ export class CorosAdapter implements PlatformAdapter {
             if (!transfer.evidence || transfer.evidence.sha256 !== sha256) {
                 return { status: 'failed', code: 'COROS_FILE_MISMATCH' };
             }
-            const stsResult = await this.raw({ url: `${HUB}/api/proxy/oss/sts`, method: 'GET',
+            const stsResult = await this.authenticatedRead(() => this.raw({ url: `${HUB}/api/proxy/oss/sts`, method: 'GET',
                 params: { bucket: 'coros-oss', service: 'aliyun', v: 2 },
-                headers: { cookie: this.headers().cookie, referer: `${HUB}/` } }, true);
+                headers: { cookie: this.headers().cookie, referer: `${HUB}/` } }, true));
             if (stsResult?.code !== 200 || typeof stsResult.data?.credentials !== 'string') {
                 throw new SyncError('COROS_STAGING_PROTOCOL', 'COROS returned invalid temporary storage credentials.');
             }
@@ -300,7 +312,7 @@ export class CorosAdapter implements PlatformAdapter {
             if (!(error instanceof SyncError) || ['TRANSPORT', 'HTTP', 'RATE_LIMIT'].includes(error.code)) {
                 return { status: 'retryable', code: error instanceof SyncError ? error.code : 'COROS_STAGING_RETRY' };
             }
-            return { status: 'failed', code: error instanceof SyncError && error.code === 'AUTH' ? 'AUTH' : 'COROS_STAGING_FAILED' };
+            return { status: 'failed', code: error.code === 'AUTH' ? 'AUTH' : 'COROS_STAGING_FAILED', detail: error.message };
         }
         const put = () => staging.client.put(staging.object, staging.packed, {
                 headers: { 'x-oss-forbid-overwrite': 'true' },
@@ -316,7 +328,7 @@ export class CorosAdapter implements PlatformAdapter {
                         receipt: { status: 'unknown', code: 'COROS_OBJECT_EXISTS' } });
                 } catch (verifyError) {
                     if (verifyError instanceof SyncError && verifyError.code === 'AUTH') {
-                        return { status: 'failed', code: 'AUTH' };
+                        return { status: 'failed', code: 'AUTH', detail: verifyError.message };
                     }
                     return { status: 'retryable', code: verifyError instanceof SyncError
                         ? verifyError.code : 'COROS_STAGING_VERIFY_RETRY' };
@@ -355,7 +367,8 @@ export class CorosAdapter implements PlatformAdapter {
             if (rejected) {
                 try { await staging.client.delete(staging.object); }
                 catch (_) { return { status: 'unknown', code: 'COROS_STAGING_CLEANUP_UNKNOWN' }; }
-                return { status: error.code === 'RATE_LIMIT' ? 'retryable' : 'failed', code: error.code };
+                return { status: error.code === 'RATE_LIMIT' ? 'retryable' : 'failed', code: error.code,
+                    ...(error.code === 'AUTH' ? { detail: error.message } : {}) };
             }
             return { status: 'unknown', code: 'COROS_IMPORT_UNKNOWN' };
         }

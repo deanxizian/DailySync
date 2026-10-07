@@ -560,6 +560,14 @@ test('a visible target cannot hide a systemic import-task protocol failure', asy
     assert.equal(h.target.uploads.length, 0);
 });
 
+test('systemic import failures retain sanitized endpoint diagnostics and stop subsequent writes', async t => {
+    const h = await harness(t, { 'garmin-cn': [activity('garmin-cn', 'g1'), activity('garmin-cn', 'g2', 3600000)] });
+    const detail = 'COROS GET https://trainingcn.coros.com/api/proxy/oss/sts returned HTTP 401; authentication was rejected.';
+    h.target.onUpload = async () => ({ status: 'failed', code: 'AUTH', detail });
+    await assert.rejects(h.run(), { code: 'AUTH', message: detail });
+    assert.equal(h.target.uploads.length, 1);
+});
+
 test('an initial systemic import receipt is checked before another verification request', async t => {
     const source = activity('garmin-cn', 'g1');
     const h = await harness(t, { 'garmin-cn': [source] });
