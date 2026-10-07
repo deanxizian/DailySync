@@ -66,6 +66,8 @@ test('COROS login uses protocol MD5, China cookies and memory-only tokens', asyn
     assert.equal(await f.adapter.connect(), hash('coros-cn:user1'));
     const login = f.calls[0];
     assert.equal(login.url, 'https://teamcnapi.coros.com/account/login');
+    assert.equal(login.headers.origin, 'https://trainingcn.coros.com');
+    assert.equal(login.headers.referer, 'https://trainingcn.coros.com/');
     assert.equal(login.data.accountType, 2);
     assert.equal(login.data.pwd, createHash('md5').update('private-test-password').digest('hex'));
     assert.ok(!JSON.stringify(login).includes('private-test-password'));
@@ -177,6 +179,44 @@ test('COROS captcha or failed password login stops without bypass or secret-bear
     await assert.rejects(injected.adapter.connect(), { code: 'AUTH' });
 });
 
+test('COROS login retries transient transport and server errors but never authentication failures', async () => {
+    let attempts = 0;
+    const recovered = fixture(config => {
+        if (!config.url.endsWith('/account/login')) return undefined;
+        if (++attempts === 1) throw Object.assign(new Error('private-test-password'), { code: 'ECONNRESET' });
+        if (attempts === 2) return { status: 503 };
+    });
+    await recovered.adapter.connect();
+    assert.equal(attempts, 3);
+    assert.deepEqual(recovered.waits, [1000, 2000]);
+    for (const status of [401, 403]) {
+        const rejected = fixture(() => ({ status, data: { message: 'private-test-password' } }));
+        await assert.rejects(rejected.adapter.connect(), error => error.code === 'AUTH' &&
+            error.message.includes('/account/login') && error.message.includes(`HTTP ${status}`) &&
+            !safeError(error).includes('private-test-password'));
+        assert.equal(rejected.calls.length, 1);
+        assert.deepEqual(rejected.waits, []);
+    }
+});
+
+test('COROS persistent login transport errors have a retry budget and credential-free diagnostics', async () => {
+    for (const code of ['ETIMEDOUT', 'private-test-password']) {
+        const failed = fixture(() => { throw Object.assign(new Error('private-token'), { code }); });
+        await assert.rejects(failed.adapter.connect(), error => {
+            assert.equal(error.code, 'TRANSPORT');
+            assert.match(error.message, /POST https:\/\/teamcnapi.coros.com\/account\/login failed after 4 attempt/);
+            assert.equal(error.message.includes('ETIMEDOUT'), code === 'ETIMEDOUT');
+            assert.doesNotMatch(safeError(error), /private-test-password|private-token|test@example/);
+            return true;
+        });
+        assert.equal(failed.calls.length, 4);
+        assert.deepEqual(failed.waits, [1000, 2000, 4000]);
+    }
+    const throttled = fixture(() => ({ status: 429, headers: { 'retry-after': '300' } }));
+    await assert.rejects(throttled.adapter.connect(), { code: 'RATE_LIMIT' });
+    assert.equal(throttled.calls.length, 1);
+});
+
 test('COROS reads honor bounded Retry-After and stop on persistent throttling', async () => {
     let reads = 0;
     const f = fixture(config => config.url.endsWith('/activity/query') && ++reads === 1
@@ -233,6 +273,12 @@ test('COROS stages one unchanged FIT in OSS and submits timezone 32 and original
     const receipt = await f.adapter.upload(f.file, f.transfer);
     assert.deepEqual(receipt, { status: 'accepted', stage: 'submitted', taskId: 'task123' });
     assert.equal(receipt.targetId, undefined);
+    const authorization = f.calls.find(call => call.url.endsWith('/api/proxy/oss/sts'));
+    assert.equal(authorization.url, 'https://trainingcn.coros.com/api/proxy/oss/sts');
+    assert.equal(authorization.headers.referer, 'https://trainingcn.coros.com/');
+    assert.equal(authorization.headers.cookie, 'CPL-coros-region=2; CPL-coros-token=test-token-1');
+    assert.deepEqual(authorization.params, { bucket: 'coros-oss', service: 'aliyun', v: 2 });
+    assert.ok(f.calls.every(call => new URL(call.url).hostname !== 't.coros.com'));
     const md5 = createHash('md5').update(f.bytes).digest('hex');
     const staged = f.staged[0];
     assert.equal(staged.options.secure, true);
@@ -288,10 +334,81 @@ test('COROS import timeout is not replayed and filename recovers the task withou
 
 test('COROS write auth rejection stops without retrying login or import POST', async t => {
     const f = await uploadFixture(t, config => config.url.endsWith('/activity/fit/import') ? { status: 200, data: { result: '1019' } } : undefined);
-    assert.deepEqual(await f.adapter.upload(f.file, f.transfer), { status: 'failed', code: 'AUTH' });
+    assert.deepEqual(await f.adapter.upload(f.file, f.transfer), { status: 'failed', code: 'AUTH',
+        detail: 'COROS POST /activity/fit/import rejected the session; no write was retried.' });
     assert.equal(f.calls.filter(call => call.url.endsWith('/account/login')).length, 1);
     assert.equal(f.calls.filter(call => call.url.endsWith('/activity/fit/import')).length, 1);
     assert.deepEqual(f.removed, [f.staged[0].object]);
+});
+
+test('COROS upload authorization expiry refreshes once before staging with the new cookie', async t => {
+    let authorizations = 0;
+    const f = await uploadFixture(t, config => config.url.endsWith('/api/proxy/oss/sts') && ++authorizations === 1
+        ? { status: 401 } : undefined);
+    assert.equal((await f.adapter.upload(f.file, f.transfer)).status, 'accepted');
+    const requests = f.calls.filter(call => call.url.endsWith('/api/proxy/oss/sts'));
+    assert.equal(requests.length, 2);
+    assert.equal(requests[0].headers.cookie, 'CPL-coros-region=2; CPL-coros-token=test-token-1');
+    assert.equal(requests[1].headers.cookie, 'CPL-coros-region=2; CPL-coros-token=test-token-2');
+    assert.equal(f.calls.filter(call => call.url.endsWith('/account/login')).length, 2);
+    assert.equal(f.calls.filter(call => call.url.endsWith('/account/query')).length, 2);
+    assert.equal(f.staged.length, 1);
+    assert.equal(f.calls.filter(call => call.url.endsWith('/activity/fit/import')).length, 1);
+});
+
+test('COROS HTTP import auth failures never replay the write or refresh the session', async t => {
+    for (const status of [401, 403]) {
+        const f = await uploadFixture(t, config => config.url.endsWith('/activity/fit/import')
+            ? { status, data: { message: 'test-token-1' } } : undefined);
+        const receipt = await f.adapter.upload(f.file, f.transfer);
+        assert.equal(receipt.status, 'failed');
+        assert.equal(receipt.code, 'AUTH');
+        assert.match(receipt.detail, new RegExp(`/activity/fit/import returned HTTP ${status}`));
+        assert.doesNotMatch(JSON.stringify(receipt), /test-token-1/);
+        assert.equal(f.calls.filter(call => call.url.endsWith('/activity/fit/import')).length, 1);
+        assert.equal(f.calls.filter(call => call.url.endsWith('/account/login')).length, 1);
+        assert.deepEqual(f.removed, [f.staged[0].object]);
+        assert.deepEqual(f.waits, []);
+    }
+});
+
+test('COROS persistent upload authorization rejection retains its endpoint without leaking response data', async t => {
+    const f = await uploadFixture(t, config => config.url.endsWith('/api/proxy/oss/sts')
+        ? { status: 401, data: { message: 'private-test-password', cookie: 'test-token-1' } } : undefined);
+    const receipt = await f.adapter.upload(f.file, f.transfer);
+    assert.deepEqual(receipt, { status: 'failed', code: 'AUTH',
+        detail: 'COROS GET https://trainingcn.coros.com/api/proxy/oss/sts returned HTTP 401; authentication was rejected.' });
+    assert.equal(f.calls.filter(call => call.url.endsWith('/account/login')).length, 2);
+    assert.equal(f.calls.filter(call => call.url.endsWith('/api/proxy/oss/sts')).length, 2);
+    assert.doesNotMatch(JSON.stringify(receipt), /private-test-password|test-token/);
+    assert.equal(f.staged.length, 0);
+    assert.equal(f.calls.some(call => call.url.endsWith('/activity/fit/import')), false);
+});
+
+test('COROS reads and upload authorization share a single re-login budget', async t => {
+    let pages = 0;
+    const f = await uploadFixture(t, config => {
+        if (config.url.endsWith('/activity/query') && ++pages === 1) return { status: 401 };
+        if (config.url.endsWith('/api/proxy/oss/sts')) return { status: 401 };
+    });
+    await f.adapter.page(0);
+    assert.equal((await f.adapter.upload(f.file, f.transfer)).code, 'AUTH');
+    assert.equal(f.calls.filter(call => call.url.endsWith('/account/login')).length, 2);
+    assert.equal(f.calls.filter(call => call.url.endsWith('/api/proxy/oss/sts')).length, 1);
+    assert.equal(f.staged.length, 0);
+});
+
+test('COROS never stages an upload after authorization refresh changes account identity', async t => {
+    let profiles = 0;
+    const f = await uploadFixture(t, config => {
+        if (config.url.endsWith('/account/query')) return success({ userId: ++profiles === 1 ? 'user1' : 'user2' });
+        if (config.url.endsWith('/api/proxy/oss/sts')) return { status: 401 };
+    });
+    const receipt = await f.adapter.upload(f.file, f.transfer);
+    assert.equal(receipt.code, 'COROS_STAGING_FAILED');
+    assert.match(receipt.detail, /account changed/);
+    assert.equal(f.calls.filter(call => call.url.endsWith('/api/proxy/oss/sts')).length, 1);
+    assert.equal(f.staged.length, 0);
 });
 
 test('COROS import throttling remains retryable without replaying the write', async t => {

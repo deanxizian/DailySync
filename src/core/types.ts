@@ -37,6 +37,8 @@ export interface ImportReceipt {
     targetId?: string;
     taskId?: string;
     code?: string;
+    // Locally generated, credential-free context only; never copy remote error bodies.
+    detail?: string;
 }
 
 export interface Transfer {
