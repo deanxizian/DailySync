@@ -152,6 +152,8 @@ export class GarminAdapter implements PlatformAdapter {
         }, this.config.domain));
         const http = this.client.client?.client;
         if (!http) return;
+        // Cross-border IPv4 handshakes can exceed Node's 250 ms dual-stack attempt limit.
+        if (options.region === 'CN') http.defaults.family = 4;
         http.defaults.timeout = 60000;
         http.defaults.maxContentLength = MAX_ACTIVITY_BYTES;
         http.defaults.maxBodyLength = MAX_ACTIVITY_BYTES;

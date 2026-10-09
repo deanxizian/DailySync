@@ -1,7 +1,10 @@
 require('ts-node/register/transpile-only');
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
+const { once } = require('node:events');
 const fs = require('node:fs/promises');
+const http = require('node:http');
+const net = require('node:net');
 const os = require('node:os');
 const path = require('node:path');
 const JSZip = require('jszip');
@@ -60,6 +63,52 @@ function fixture(options = {}) {
     f.saved = { loginHash: garminAccountHash(slot, username), token: tokens };
     return f;
 }
+
+test('Garmin CN IPv4 selection reaches the real SDK transport without changing Global or cookie support', async t => {
+    const requests = [], lookups = [];
+    const networkDefaults = [net.getDefaultAutoSelectFamily(), net.getDefaultAutoSelectFamilyAttemptTimeout()];
+    const server = http.createServer((request, response) => {
+        const pathname = new URL(request.url, 'http://garmin.test.invalid').pathname;
+        requests.push({ pathname, cookie: request.headers.cookie });
+        response.setHeader('Content-Type', 'application/json');
+        response.setHeader('Set-Cookie', 'network-test=present; Path=/');
+        response.end(JSON.stringify(pathname === '/profile' ? profile : [row]));
+    });
+    server.listen(0, '127.0.0.1');
+    await once(server, 'listening');
+    t.after(() => new Promise(resolve => server.close(resolve)));
+    const base = `http://garmin.test.invalid:${server.address().port}`;
+    for (const region of ['CN', 'GLOBAL']) {
+        const f = fixture({ region });
+        const transport = f.client.client.client;
+        transport.defaults.adapter = 'http';
+        transport.defaults.proxy = false;
+        transport.defaults.lookup = (hostname, options, callback) => {
+            lookups.push({ region, hostname, family: options.family ?? 0 });
+            if (options.all) callback(null, [{ address: '127.0.0.1', family: 4 }]);
+            else callback(null, '127.0.0.1', 4);
+        };
+        transport.interceptors.request.use(config => {
+            const url = new URL(config.url);
+            config.url = url.pathname === '/userprofile-service/socialProfile'
+                ? `${base}/profile` : `${base}/activities`;
+            return config;
+        });
+        assert.equal(await f.adapter.connect(f.saved), hash(`${f.adapter.slot}:123`));
+        assert.equal((await f.adapter.page(0)).activities[0].id, '321');
+        assert.deepEqual(f.waits, []);
+        assert.equal(f.logins, 0);
+        assert.equal(transport.defaults.timeout, 60000);
+    }
+    assert.deepEqual(lookups, ['CN', 'CN', 'GLOBAL', 'GLOBAL'].map(region => ({
+        region, hostname: 'garmin.test.invalid', family: region === 'CN' ? 4 : 0,
+    })));
+    assert.equal(requests.length, 4);
+    const activityRequests = requests.filter(request => request.pathname === '/activities');
+    assert.equal(activityRequests.length, 2);
+    assert.ok(activityRequests.every(request => request.cookie === 'network-test=present'));
+    assert.deepEqual([net.getDefaultAutoSelectFamily(), net.getDefaultAutoSelectFamilyAttemptTimeout()], networkDefaults);
+});
 
 test('Garmin normalization uses UTC, stable sport families and lossless IDs for either region', () => {
     assert.deepEqual(normalizeGarmin(row), activity('garmin-cn', '321'));
