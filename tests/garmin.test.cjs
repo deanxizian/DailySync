@@ -24,7 +24,7 @@ function fixture(options = {}) {
     const domain = region === 'CN' ? 'garmin.cn' : 'garmin.com';
     const slot = region === 'CN' ? 'garmin-cn' : 'garmin-global';
     const calls = [], waits = [];
-    const f = { calls, waits, logins: 0, refreshes: 0 };
+    const f = { calls, waits, logins: 0, refreshes: 0, consumerFetches: 0, retries: [] };
     const log = console.log;
     console.log = () => {};
     try { f.client = new GarminConnect({ username, password }, domain); }
@@ -37,14 +37,21 @@ function fixture(options = {}) {
     };
     f.adapter = new GarminAdapter({ region, username, password, client,
         wait: async delay => { waits.push(delay); }, pageSize: options.pageSize, writable: options.writable,
-        onSession: options.onSession });
+        onSession: options.onSession, onRetry: message => f.retries.push(message) });
+    client.client.fetchOauthConsumer = async () => {
+        f.consumerFetches++;
+        client.client.OAUTH_CONSUMER = { key: 'consumer-key', secret: 'consumer-secret' };
+    };
     client.client.refreshOauth2Token = async () => {
         f.refreshes++;
         client.loadToken(tokens.oauth1, { ...tokens.oauth2, access_token: 'refreshed' });
     };
     client.client.client.defaults.adapter = async config => {
         calls.push(config);
-        const response = await options.handler?.(config, f) ?? { status: 200, data: profile };
+        const response = await options.handler?.(config, f) ?? { status: 200,
+            data: config.url.includes('/oauth-service/oauth/exchange/user/2.0')
+                ? { access_token: 'refreshed', expires_in: 3600,
+                    refresh_token: 'refreshed-refresh', refresh_token_expires_in: 86400 } : profile };
         const result = { config, statusText: 'Test response', headers: {}, ...response };
         if (result.status >= 400) throw Object.assign(new Error('private response body'),
             { isAxiosError: true, config, response: result });
@@ -184,10 +191,10 @@ test('consumer metadata transient failures exhaust bounded retries without passw
         };
         await assert.rejects(f.adapter.connect({ ...f.saved, token: { oauth1: tokens.oauth1 } }),
             error => error.code === 'GARMIN_READ' && !safeError(error).includes('private-token'));
-        assert.equal(consumerFetches, 4);
+        assert.equal(consumerFetches, 5);
         assert.equal(f.logins, 0);
         assert.deepEqual(f.calls, []);
-        assert.deepEqual(f.waits, [1000, 2000, 4000]);
+        assert.deepEqual(f.waits, [5000, 15000, 45000, 120000]);
         assert.equal(f.adapter.exportSession(), undefined);
     }
 });
@@ -202,10 +209,10 @@ test('OAuth1 exchange throttling retries only the exchange without password logi
     await assert.rejects(f.adapter.connect({ ...f.saved, token: { oauth1: tokens.oauth1 } }),
         error => error.code === 'GARMIN_READ' && !safeError(error).includes('private response body'));
     assert.equal(consumerFetches, 1);
-    assert.equal(f.calls.length, 4);
+    assert.equal(f.calls.length, 5);
     assert.ok(f.calls.every(call => call.url.includes('/oauth-service/oauth/exchange/user/2.0')));
     assert.equal(f.logins, 0);
-    assert.deepEqual(f.waits, [1000, 2000, 4000]);
+    assert.deepEqual(f.waits, [5000, 15000, 45000, 120000]);
     assert.equal(f.adapter.exportSession(), undefined);
 });
 
@@ -251,20 +258,172 @@ test('Garmin Global uses the Global API host and slot', async () => {
 test('Garmin refreshes OAuth and bounds retry delays without leaking response bodies', async () => {
     const refreshed = fixture({ handler: (_config, f) => f.calls.length === 1 ? { status: 401 } : undefined });
     await refreshed.adapter.connect(refreshed.saved);
-    assert.equal(refreshed.refreshes, 1);
+    assert.equal(refreshed.refreshes, 0);
+    assert.equal(refreshed.calls.filter(call => call.url.includes('/oauth-service/oauth/exchange/user/2.0')).length, 1);
     assert.equal(refreshed.logins, 0);
     assert.equal(refreshed.adapter.exportSession().token.oauth2.access_token, 'refreshed');
 
     const limited = fixture({ handler: (_config, f) => f.calls.length === 1
-        ? { status: 429, headers: { 'retry-after': '3' } } : undefined });
+        ? { status: 429, headers: { 'retry-after': '30' } } : undefined });
     await limited.adapter.connect(limited.saved);
-    assert.deepEqual(limited.waits, [3000]);
+    assert.deepEqual(limited.waits, [30000]);
     const long = fixture({ handler: () => ({ status: 429, headers: { 'retry-after': '300' } }) });
     await assert.rejects(long.adapter.connect(long.saved), { code: 'RATE_LIMIT' });
     const network = fixture({ handler: () => { throw new Error('private-session-in-network-error'); } });
     await assert.rejects(network.adapter.page(0),
         error => error.code === 'GARMIN_READ' && !safeError(error).includes('private-session'));
-    assert.deepEqual(network.waits, [1000, 2000, 4000]);
+    assert.deepEqual(network.waits, [5000, 15000, 45000, 120000]);
+});
+
+test('transient Garmin reads recover within the same run after the old retry window is exhausted', async () => {
+    for (const region of ['CN', 'GLOBAL']) {
+        for (const cause of ['ECONNRESET', 'ETIMEDOUT', 429, 503]) {
+            const f = fixture({ region, handler: (config, current) => {
+                if (current.calls.length === 5) return { status: 200, data: [row] };
+                if (typeof cause === 'number') return { status: cause };
+                throw Object.assign(new Error('private network details'), { config, code: cause });
+            } });
+            const result = await f.adapter.page(100);
+            assert.equal(result.activities[0].id, '321');
+            assert.equal(result.next, 101);
+            assert.equal(f.calls.length, 5);
+            assert.ok(f.calls.every(call => call.params.start === 100));
+            assert.deepEqual(f.waits, [5000, 15000, 45000, 120000]);
+            assert.equal(f.retries.length, 4);
+            assert.ok(f.retries[0].includes('activity list at offset 100'));
+            assert.ok(f.retries[3].includes('retry 4/4 in 120s'));
+            assert.equal(f.logins, 0);
+        }
+    }
+});
+
+test('Garmin failure diagnostics retain the operation and safe cause but never credentials', async () => {
+    const f = fixture({ handler: config => {
+        const errorConfig = { ...config,
+            url: 'https://private-user:private-password@connectapi.garmin.cn/activitylist-service/activities/search/activities?token=private-query',
+            headers: { Authorization: 'private-header' } };
+        throw Object.assign(new Error('private-message'), { config: errorConfig, cause: { code: 'ECONNRESET' } });
+    } });
+    let failure;
+    await assert.rejects(f.adapter.page(200), error => {
+        failure = safeError(error);
+        return error.code === 'GARMIN_READ';
+    });
+    const messages = [...f.retries, failure].join('\n');
+    assert.ok(messages.includes('GET connectapi.garmin.cn/activitylist-service/activities/search/activities'));
+    assert.ok(messages.includes('ECONNRESET'));
+    assert.ok(failure.includes('activity list at offset 200'));
+    assert.ok(failure.includes('after 5 attempt(s)'));
+    assert.ok(!messages.includes('private-'));
+    assert.equal(f.calls.length, 5);
+
+    const unknown = fixture({ handler: config => {
+        throw Object.assign(new Error('private-message'), { config, code: 'private-code' });
+    } });
+    await assert.rejects(unknown.adapter.page(0), error =>
+        error.code === 'GARMIN_READ' && error.message.includes('unknown cause') && !error.message.includes('private-'));
+    assert.ok(unknown.retries.every(message => !message.includes('private-')));
+});
+
+test('Garmin does not retry permanent HTTP errors or override a server cooldown', async () => {
+    for (const status of [400, 404]) {
+        const f = fixture({ handler: () => ({ status }) });
+        await assert.rejects(f.adapter.page(0), error => error.code === 'GARMIN_READ' &&
+            error.message.includes(`HTTP ${status}`) && error.message.includes('after 1 attempt(s)'));
+        assert.equal(f.calls.length, 1);
+        assert.deepEqual(f.waits, []);
+        assert.deepEqual(f.retries, []);
+    }
+    const limited = fixture({ handler: () => ({ status: 429, headers: { 'retry-after': '300' } }) });
+    await assert.rejects(limited.adapter.page(0), error => error.code === 'RATE_LIMIT' &&
+        error.message.includes('HTTP 429') && error.message.includes('activity list'));
+    assert.equal(limited.calls.length, 1);
+    assert.deepEqual(limited.waits, []);
+});
+
+test('a reset during a 401-triggered OAuth exchange retries OAuth1 without password login', async () => {
+    for (const region of ['CN', 'GLOBAL']) {
+        let exchanges = 0, profiles = 0;
+        const persisted = [];
+        const f = fixture({ region, onSession: async saved => persisted.push(saved), handler: (config, current) => {
+            if (config.url.includes('/oauth-service/oauth/exchange/user/2.0')) {
+                exchanges++;
+                // Exercise the real SDK behavior: OAuth2 has already been cleared before each POST.
+                assert.equal(current.client.client.oauth2Token, undefined);
+                if (exchanges < 3) throw Object.assign(new Error('private reset'), { config, code: 'ECONNRESET' });
+                return;
+            }
+            profiles++;
+            if (config.headers.Authorization !== 'Bearer refreshed') return { status: 401 };
+        } });
+        await f.adapter.connect(f.saved);
+        assert.equal(profiles, 2);
+        assert.equal(exchanges, 3);
+        assert.equal(f.consumerFetches, 1);
+        assert.equal(f.logins, 0);
+        assert.equal(f.refreshes, 0);
+        assert.deepEqual(f.waits, [5000, 15000]);
+        assert.equal(persisted.length, 1);
+        assert.equal(persisted[0].token.oauth2.access_token, 'refreshed');
+        assert.deepEqual(persisted[0].token.oauth1, tokens.oauth1);
+        assert.ok(f.retries.every(message => message.includes('OAuth exchange') && !message.includes('private')));
+    }
+});
+
+test('exhausted OAuth refresh retries do not send unauthenticated reads or fall back to password login', async () => {
+    const persisted = [];
+    const f = fixture({ allowLogin: true, onSession: async saved => persisted.push(saved), handler: config => {
+        if (config.url.includes('/oauth-service/oauth/exchange/user/2.0')) {
+            throw Object.assign(new Error('private reset'), { config, code: 'ECONNRESET' });
+        }
+        return { status: 401 };
+    } });
+    await assert.rejects(f.adapter.connect(f.saved), error => error.code === 'GARMIN_READ' &&
+        error.message.includes('OAuth exchange') && error.message.includes('ECONNRESET'));
+    assert.equal(f.calls.filter(call => call.url.includes('/oauth-service/oauth/exchange/user/2.0')).length, 5);
+    assert.equal(f.calls.length, 6);
+    assert.equal(f.logins, 0);
+    assert.deepEqual(persisted, []);
+    assert.equal(f.adapter.exportSession(), undefined);
+});
+
+test('metadata rejection during a 401-triggered refresh is not a reason for password login', async () => {
+    for (const status of [401, 403]) {
+        const f = fixture({ allowLogin: true, handler: () => ({ status: 401 }) });
+        f.client.client.fetchOauthConsumer = async () => {
+            throw Object.assign(new Error('private-metadata'), { response: { status } });
+        };
+        await assert.rejects(f.adapter.connect(f.saved), error => error.code === 'GARMIN_READ' &&
+            error.message.includes('OAuth consumer metadata') && error.message.includes(`HTTP ${status}`));
+        assert.equal(f.calls.length, 1);
+        assert.equal(f.logins, 0);
+        assert.deepEqual(f.waits, []);
+    }
+});
+
+test('later OAuth refresh reuses consumer metadata even when the metadata service is unavailable', async () => {
+    for (const region of ['CN', 'GLOBAL']) {
+        let listRequests = 0, refetches = 0;
+        const f = fixture({ region, handler: config => {
+            if (config.url.includes('/activitylist-service/')) {
+                listRequests++;
+                return listRequests === 1 ? { status: 401 } : { status: 200, data: [row] };
+            }
+        } });
+        await f.adapter.connect({ ...f.saved, token: { oauth1: tokens.oauth1 } });
+        f.client.client.fetchOauthConsumer = async () => {
+            refetches++;
+            throw Object.assign(new Error('metadata unavailable'), { response: { status: 503 } });
+        };
+        const result = await f.adapter.page(0);
+        assert.equal(result.activities[0].id, '321');
+        assert.equal(f.consumerFetches, 1);
+        assert.equal(refetches, 0);
+        assert.equal(f.calls.filter(call => call.url.includes('/oauth-service/oauth/exchange/user/2.0')).length, 2);
+        assert.equal(listRequests, 2);
+        assert.equal(f.logins, 0);
+        assert.deepEqual(f.waits, []);
+    }
 });
 
 test('Garmin preserves FIT and TCX originals and classifies unavailable exports', async t => {
@@ -344,4 +503,7 @@ test('Garmin duplicate, transient and unknown upload outcomes stay distinguishab
     assert.deepEqual(receipt, { status: 'unknown', code: 'GARMIN_UPLOAD_UNKNOWN' });
     assert.deepEqual(await unknown.adapter.verify({ ...transfer, receipt }),
         { status: 'pending', code: 'GARMIN_UPLOAD_UNKNOWN' });
+    assert.equal(unknown.calls.filter(call => call.url.includes('/upload-service/upload/.fit')).length, 1);
+    assert.deepEqual(unknown.waits, []);
+    assert.deepEqual(unknown.retries, []);
 });
