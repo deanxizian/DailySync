@@ -29,6 +29,25 @@ test('a missing COROS activity uploads to Garmin and is skipped on the next stat
     assert.equal(h.target.uploads.length, 1);
 });
 
+test('a failed full scan cannot mark a missing activity complete and the next run catches up', async t => {
+    const source = [activity('garmin-cn', 'new', 3600000), activity('garmin-cn', 'existing'),
+        activity('garmin-cn', 'older', -3600000)];
+    const h = await harness(t, { 'garmin-cn': source, 'coros-cn': [activity('coros-cn', 'existing')] });
+    h.source.onPage = async cursor => {
+        if (cursor === 2) throw new SyncError('GARMIN_READ', 'Activity list retry budget exhausted.');
+    };
+    await assert.rejects(h.run(), { code: 'GARMIN_READ' });
+    assert.equal(h.target.uploads.length, 0);
+    h.source.onPage = undefined;
+    let events = await h.run();
+    assert.deepEqual(events.filter(event => event.status === 'uploaded').map(event => event.source),
+        ['garmin-cn:new', 'garmin-cn:older']);
+    assert.equal(h.target.uploads.length, 2);
+    events = await h.run();
+    assert.ok(events.every(event => event.status === 'existing'));
+    assert.equal(h.target.uploads.length, 2);
+});
+
 test('a unique summary match is treated as existing without downloading FIT files', async t => {
     const source = activity('garmin-cn', 'g1');
     const target = activity('coros-cn', 'c1');

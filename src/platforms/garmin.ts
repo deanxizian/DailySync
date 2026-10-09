@@ -10,6 +10,24 @@ import { extractGarminActivity, MAX_ACTIVITY_BYTES } from '../formats/files';
 const { GarminConnect } = require('@gooin/garmin-connect');
 const { canonicalSport } = require('../core/sports.js') as { canonicalSport: (value: unknown) => string };
 const DAY_MS = 24 * 60 * 60 * 1000;
+const READ_RETRY_DELAYS = [5000, 15000, 45000, 120000];
+const TRANSPORT_CODES = new Set([
+    'ECONNABORTED', 'ECONNRESET', 'ECONNREFUSED', 'ETIMEDOUT', 'ENOTFOUND', 'EAI_AGAIN',
+    'EHOSTUNREACH', 'ENETUNREACH', 'EPIPE', 'ERR_NETWORK',
+]);
+
+interface RequestFailure {
+    status?: number;
+    transport?: string;
+    request?: string;
+    retryAfter: number;
+}
+
+class GarminRequestError extends Error {
+    constructor(readonly failure: RequestFailure) {
+        super('Garmin request failed.');
+    }
+}
 
 type GarminRegion = 'CN' | 'GLOBAL';
 
@@ -34,6 +52,7 @@ export interface GarminAdapterOptions {
     pageSize?: number;
     writable?: boolean;
     onSession?: (saved: SavedSession) => Promise<void>;
+    onRetry?: (message: string) => void;
 }
 
 function utcDay(timestamp: number): string {
@@ -54,10 +73,40 @@ export function normalizeGarmin(row: any, slot: GarminSlot = 'garmin-cn'): Activ
 }
 
 function httpStatus(error: any): number | undefined {
+    if (error instanceof GarminRequestError) return error.failure.status;
     const status = error?.response?.status;
     if (Number.isInteger(status)) return status;
     const match = typeof error?.message === 'string' ? /^ERROR: \((\d{3})\)/.exec(error.message) : null;
     return match ? Number(match[1]) : undefined;
+}
+
+function requestFailure(error: any): RequestFailure {
+    if (error instanceof GarminRequestError) return error.failure;
+    const code = error?.code ?? error?.cause?.code;
+    const retry = error?.response?.headers?.['retry-after'];
+    const seconds = Number(retry);
+    const delay = Number.isFinite(seconds) ? seconds * 1000 : Date.parse(String(retry)) - Date.now();
+    let request: string | undefined;
+    try {
+        const url = new URL(error.config.url);
+        const method = String(error.config.method).toUpperCase();
+        if (['connectapi.garmin.cn', 'connectapi.garmin.com'].includes(url.hostname) &&
+            ['GET', 'HEAD', 'POST'].includes(method)) {
+            // Keep only known endpoint paths, never query strings, headers or dynamic identifiers.
+            const pathname = url.pathname.replace(/\/download-service\/files\/activity\/[^/]+$/, '/download-service/files/activity/:id');
+            if (['/userprofile-service/socialProfile', '/activitylist-service/activities/search/activities',
+                '/oauth-service/oauth/exchange/user/2.0', '/download-service/files/activity/:id'].includes(pathname)) {
+                request = `${method} ${url.hostname}${pathname}`;
+            }
+        }
+    } catch (_) {}
+    return { status: httpStatus(error), transport: TRANSPORT_CODES.has(code) ? code : undefined,
+        request, retryAfter: Number.isFinite(delay) ? Math.max(0, delay) : 0 };
+}
+
+function failureDetail(failure: RequestFailure): string {
+    return [failure.request, failure.status ? `HTTP ${failure.status}` : failure.transport ?? 'unknown cause']
+        .filter(Boolean).join('; ');
 }
 
 async function quiet<T>(action: () => Promise<T>): Promise<T> {
@@ -82,6 +131,7 @@ export class GarminAdapter implements PlatformAdapter {
     private readonly wait: (milliseconds: number) => Promise<void>;
     private readonly pageSize: number;
     private readonly writable: boolean;
+    private readonly onRetry: (message: string) => void;
     private loginInProgress = false;
     private connected = false;
 
@@ -91,6 +141,7 @@ export class GarminAdapter implements PlatformAdapter {
         this.wait = options.wait ?? sleep;
         this.pageSize = options.pageSize ?? 100;
         this.writable = options.writable ?? false;
+        this.onRetry = options.onRetry ?? console.warn.bind(console);
         if (!Number.isSafeInteger(this.pageSize) || this.pageSize <= 0) {
             throw new SyncError('CONFIG', 'Garmin page size must be a positive integer.');
         }
@@ -130,31 +181,31 @@ export class GarminAdapter implements PlatformAdapter {
             const request = error?.config;
             const status = error?.response?.status;
             if (status === 401 && request && ['get', 'head'].includes(String(request.method).toLowerCase()) &&
-                !request._dailySyncRefreshed && this.client.client.oauth2Token) {
+                !request._dailySyncRefreshed && this.client.client.oauth1Token) {
                 request._dailySyncRefreshed = true;
-                await this.client.client.refreshOauth2Token();
+                await this.exchangeOauth1(this.client.client.oauth1Token);
                 return http.request(request);
             }
-            const sanitized: any = new Error(Number.isInteger(status) ? `ERROR: (${status}), Garmin request failed.` : 'Garmin request failed.');
-            if (Number.isInteger(status)) {
-                sanitized.response = { status, headers: { 'retry-after': error.response.headers?.['retry-after'] } };
-            }
-            throw sanitized;
+            throw new GarminRequestError(requestFailure(error));
         });
     }
 
-    private async read<T>(action: () => Promise<T>, activityExport = false): Promise<T> {
+    private async read<T>(operation: string, action: () => Promise<T>, activityExport = false): Promise<T> {
         for (let attempt = 0; ; attempt++) {
             try { return await quiet(action); }
             catch (error) {
                 if (error instanceof SyncError) throw error;
-                const status = httpStatus(error);
-                if (attempt < 3 && (status === undefined || [408, 425, 429].includes(status ?? 0) || (status ?? 0) >= 500)) {
-                    const retry = (error as any)?.response?.headers?.['retry-after'];
-                    const seconds = Number(retry);
-                    const delay = Number.isFinite(seconds) ? seconds * 1000 : Date.parse(String(retry)) - Date.now();
-                    if (delay > 120000) throw new SyncError('RATE_LIMIT', `${this.config.label} requested a long retry delay.`);
-                    await this.wait(Math.max(1000 * 2 ** attempt, Number.isFinite(delay) ? delay : 0));
+                const failure = requestFailure(error);
+                const { status } = failure;
+                const detail = `${this.config.label} ${operation} failed (${failureDetail(failure)})`;
+                if (attempt < READ_RETRY_DELAYS.length &&
+                    (status === undefined || [408, 425, 429].includes(status) || status >= 500)) {
+                    if (failure.retryAfter > 120000) {
+                        throw new SyncError('RATE_LIMIT', `${detail}; server requested a retry delay longer than 120 seconds.`);
+                    }
+                    const delay = Math.max(READ_RETRY_DELAYS[attempt]!, failure.retryAfter);
+                    this.onRetry(`${detail}; retry ${attempt + 1}/${READ_RETRY_DELAYS.length} in ${delay / 1000}s.`);
+                    await this.wait(delay);
                     continue;
                 }
                 if (activityExport && status !== undefined && status >= 400 && status < 500 &&
@@ -163,9 +214,27 @@ export class GarminAdapter implements PlatformAdapter {
                         `${this.config.label} activity export is permanently unavailable (HTTP ${status}).`);
                 }
                 throw new SyncError(status === 401 || status === 403 ? 'GARMIN_SESSION_INVALID' : 'GARMIN_READ',
-                    `${this.config.label} request failed${status ? ` (HTTP ${status})` : ''}.`);
+                    `${detail} after ${attempt + 1} attempt(s).`);
             }
         }
+    }
+
+    private async exchangeOauth1(oauth1: any): Promise<void> {
+        const http = this.client.client;
+        // Metadata failures are not rejected account credentials and must not trigger password login.
+        if (!http.OAUTH_CONSUMER) {
+            try { await this.read('OAuth consumer metadata', () => http.fetchOauthConsumer()); }
+            catch (error) {
+                if (error instanceof SyncError && error.code === 'GARMIN_SESSION_INVALID') {
+                    throw new SyncError('GARMIN_READ', error.message);
+                }
+                throw error;
+            }
+        }
+        await this.read('OAuth exchange', async () => {
+            // The SDK clears OAuth2 before exchange, so retry using OAuth1 directly after a lost response.
+            await http.exchange({ oauth: http.getOauthClient(http.OAUTH_CONSUMER), token: oauth1 });
+        });
     }
 
     private async passwordLogin(): Promise<any> {
@@ -180,7 +249,7 @@ export class GarminAdapter implements PlatformAdapter {
         } finally {
             this.loginInProgress = false;
         }
-        return this.read<any>(() => this.client.getUserProfile());
+        return this.read<any>('profile', () => this.client.getUserProfile());
     }
 
     async connect(saved?: SavedSession): Promise<string> {
@@ -195,25 +264,9 @@ export class GarminAdapter implements PlatformAdapter {
             await this.client.loadToken(saved.token.oauth1, saved.token.oauth2);
             const needsExchange = !saved.token.oauth2 || !Number.isFinite(saved.token.oauth2.expires_at) ||
                 saved.token.oauth2.expires_at <= Date.now() / 1000 + 60;
-            if (needsExchange) {
-                // Consumer metadata is not account authentication; its failure must never trigger password login.
-                try { await this.read(() => this.client.client.fetchOauthConsumer()); }
-                catch (error) {
-                    if (error instanceof SyncError && error.code === 'GARMIN_SESSION_INVALID') {
-                        throw new SyncError('GARMIN_READ', error.message);
-                    }
-                    throw error;
-                }
-            }
             try {
-                if (needsExchange) {
-                    await this.read(async () => {
-                        const http = this.client.client;
-                        // The SDK refresh helper requires OAuth2; a cache miss must exchange OAuth1 directly.
-                        await http.exchange({ oauth: http.getOauthClient(http.OAUTH_CONSUMER), token: saved.token.oauth1 });
-                    });
-                }
-                profile = await this.read<any>(() => this.client.getUserProfile());
+                if (needsExchange) await this.exchangeOauth1(saved.token.oauth1);
+                profile = await this.read<any>('profile', () => this.client.getUserProfile());
             }
             catch (error) {
                 if (!(error instanceof SyncError) || error.code !== 'GARMIN_SESSION_INVALID') throw error;
@@ -249,7 +302,7 @@ export class GarminAdapter implements PlatformAdapter {
         }
         const startDate = window ? utcDay(window.start - DAY_MS) : undefined;
         const endDate = window ? utcDay(window.end + DAY_MS) : undefined;
-        const rows = await this.read<any>(() => this.client.getActivities(cursor, this.pageSize,
+        const rows = await this.read<any>(`activity list at offset ${cursor}`, () => this.client.getActivities(cursor, this.pageSize,
             undefined, undefined, undefined, undefined, undefined, startDate, endDate));
         if (!Array.isArray(rows)) throw new SyncError('PROTOCOL', 'Garmin activity page is not a list.');
         return { activities: rows.map((row: any) => normalizeGarmin(row, this.slot)),
@@ -257,7 +310,7 @@ export class GarminAdapter implements PlatformAdapter {
     }
 
     async download(activity: Activity, directory: string): Promise<string> {
-        await this.read(() => this.client.downloadOriginalActivityData({ activityId: activity.id }, directory), true);
+        await this.read('activity export', () => this.client.downloadOriginalActivityData({ activityId: activity.id }, directory), true);
         const archive = path.join(directory, `${activity.id}.zip`);
         await fs.chmod(archive, 0o600);
         return extractGarminActivity(archive, directory, activity);
